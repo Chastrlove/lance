@@ -108,6 +108,7 @@ impl JsonIndex {
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
+            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -195,6 +196,7 @@ impl ScalarIndex for JsonIndex {
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
+            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -1027,6 +1029,7 @@ impl BasicTrainer for JsonIndexPlugin {
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
+            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1175,6 +1178,7 @@ mod tests {
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
             path: "$.value".to_string(),
             target_details: Some(target_details),
+            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
         })
         .unwrap();
 
@@ -1207,6 +1211,7 @@ mod tests {
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
             path: "$.value".to_string(),
             target_details: Some(target_details),
+            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
         })
         .unwrap();
 
