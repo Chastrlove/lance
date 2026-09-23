@@ -318,6 +318,7 @@ impl ExistingIndex {
                     &coverage.dataset,
                     &coverage.effective_frags,
                     &coverage.deleted_frags,
+                    false,
                 )
             })
             .await?;
