@@ -390,6 +390,17 @@ impl LanceCache {
             .ok()
     }
 
+    /// Report whether an entry is resident without counting as an access.
+    pub async fn peek_resident_with_key<K: CacheKey>(&self, cache_key: &K) -> bool {
+        let key = self.sized_key(cache_key);
+        self.state.backend.peek_resident(&key).await
+    }
+
+    /// Whether lower layered planes gate RAM admission on a resident sign plane.
+    pub fn plane_admission_gated(&self) -> bool {
+        self.state.backend.plane_admission_gated()
+    }
+
     /// Read memory or persistent storage without promoting a persistent hit.
     pub async fn get_without_promotion_with_key<K>(
         &self,
@@ -656,6 +667,20 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         self.upgrade()?.get_resident_with_key(cache_key).await
+    }
+
+    /// Report residency without counting as an access; a dropped cache holds nothing.
+    pub async fn peek_resident_with_key<K: CacheKey>(&self, cache_key: &K) -> bool {
+        match self.upgrade() {
+            Some(cache) => cache.peek_resident_with_key(cache_key).await,
+            None => false,
+        }
+    }
+
+    /// Whether lower layered planes gate RAM admission; a dropped cache keeps the default.
+    pub fn plane_admission_gated(&self) -> bool {
+        self.upgrade()
+            .is_none_or(|cache| cache.plane_admission_gated())
     }
 
     /// Read a cached candidate plane without whole-entry RAM admission.
@@ -1169,6 +1194,24 @@ mod tests {
             Some(&vec![2])
         );
         assert_eq!((cache.stats().await.hits, cache.size().await), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn residency_peek_and_plane_gating_pass_through() {
+        let cache = LanceCache::with_capacity(4096);
+        let weak = WeakLanceCache::from(&cache);
+        assert!(!cache.peek_resident_with_key(&TestKey::new(1)).await);
+        cache
+            .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+            .await;
+        assert!(cache.peek_resident_with_key(&TestKey::new(1)).await);
+        assert!(weak.peek_resident_with_key(&TestKey::new(1)).await);
+        assert!(!weak.peek_resident_with_key(&TestKey::new(2)).await);
+        assert!(cache.plane_admission_gated() && weak.plane_admission_gated());
+
+        drop(cache);
+        assert!(!weak.peek_resident_with_key(&TestKey::new(1)).await);
+        assert!(weak.plane_admission_gated());
     }
 
     #[tokio::test]

@@ -241,7 +241,11 @@ impl CacheKey for PlaneKey {
         "RQPlane"
     }
     fn codec_for_key(&self) -> Option<CacheCodec> {
-        Self::codec().map(|codec| codec.with_memory_priority(3 - self.plane))
+        Self::codec().map(|codec| {
+            codec
+                .with_plane_tag(self.plane)
+                .with_memory_priority(3 - self.plane)
+        })
     }
     fn codec() -> Option<CacheCodec> {
         Some(CacheCodec::from_impl::<PlaneBatch>())
@@ -571,10 +575,59 @@ mod tests {
                             .into_iter()
                             .map(|n| (n.id, n.dist.0))
                             .collect();
-                        assert_eq!(
-                            actual, expected,
-                            "bits={bits} precision={precision:?} dim={dim} centered={centered} mode={approx_mode:?}"
+                        let case = format!(
+                            "bits={bits} precision={precision:?} dim={dim} centered={centered} mode={approx_mode:?} range={lower:?}..{upper:?}"
                         );
+                        if precision == RQPrecision::Full {
+                            let mut native_scratch = Vec::new();
+                            let native = single.dist_calculator_with_scratch(
+                                query.clone(),
+                                dist_q_c,
+                                context(),
+                                &mut native_scratch,
+                                DistanceCalculatorOptions {
+                                    approx_mode,
+                                    rq_precision: RQPrecision::Full,
+                                },
+                            );
+                            let mut native_heap = std::collections::BinaryHeap::new();
+                            native.accumulate_topk_with_scratch(
+                                3,
+                                lower,
+                                upper,
+                                u64::from,
+                                &mut native_heap,
+                                &mut Vec::new(),
+                                &mut Vec::new(),
+                                &mut Vec::new(),
+                                &mut Vec::new(),
+                            );
+                            let native_actual: Vec<_> = native_heap
+                                .into_sorted_vec()
+                                .into_iter()
+                                .map(|n| (n.id, n.dist.0))
+                                .collect();
+                            assert_eq!(actual, native_actual, "{case}");
+                        }
+                        // Normal mode (and Full in both modes) prunes with native's
+                        // statistical confidence bound, which a random rotation can violate
+                        // for a true top-k row. Pruned top-k is only guaranteed exact when
+                        // every expected row's bound holds.
+                        let binary = calc.binary_inner_products();
+                        let bounds_hold = expected.iter().all(|&(id, d)| {
+                            calc.raw_query_lower_bound(id as usize, binary[id as usize])
+                                .is_none_or(|bound| bound <= d)
+                        });
+                        if bounds_hold {
+                            // Equal distances have no defined order in the heap output.
+                            let by_distance_then_id = |a: &(u64, f32), b: &(u64, f32)| {
+                                a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
+                            };
+                            let mut actual = actual;
+                            actual.sort_by(by_distance_then_id);
+                            expected.sort_by(by_distance_then_id);
+                            assert_eq!(actual, expected, "{case}");
+                        }
                     }
                 }
             }
@@ -597,6 +650,22 @@ mod tests {
                 .len(),
             ROWS
         );
+    }
+
+    #[test]
+    fn plane_key_codec_tags_plane_and_priority() {
+        for plane in 0..=2u8 {
+            let codec = PlaneKey {
+                partition: 7,
+                plane,
+            }
+            .codec_for_key()
+            .unwrap();
+            assert_eq!(codec.plane_tag(), Some(plane));
+            assert_eq!(codec.memory_priority(), 3 - plane);
+            assert!(codec.supports_row_selection());
+        }
+        assert_eq!(PlaneKey::codec().unwrap().plane_tag(), None);
     }
 
     #[rstest]
