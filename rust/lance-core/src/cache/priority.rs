@@ -43,6 +43,10 @@ impl<T: Clone> PriorityEntries<T> {
         self.order.insert((*priority, *stamp), *key);
         Some(value.clone())
     }
+    /// Membership only; unlike [`get`](Self::get), recency is unchanged.
+    pub fn contains(&self, key: &InternalCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
     pub fn remove(&mut self, key: &InternalCacheKey) -> Option<T> {
         let (priority, stamp, bytes, value) = self.entries.remove(key)?;
         self.order.remove(&(priority, stamp));
@@ -130,5 +134,21 @@ mod tests {
             vec![2]
         );
         assert_eq!(cache.bytes(), 100);
+    }
+
+    #[test]
+    fn contains_reports_self_evicted_admissions() {
+        let (sign, low) = (
+            InternalCacheKey::from_bytes([1; 16]),
+            InternalCacheKey::from_bytes([3; 16]),
+        );
+        let mut cache = PriorityEntries::default();
+        cache.insert(sign, 1, 80, 3, 100);
+        assert!(cache.contains(&sign));
+        // The low plane is the minimum of the strict order, so its own
+        // admission evicts it and the sign plane stays resident.
+        assert_eq!(cache.insert(low, 2, 40, 1, 100), vec![2]);
+        assert!(!cache.contains(&low));
+        assert!(cache.contains(&sign));
     }
 }

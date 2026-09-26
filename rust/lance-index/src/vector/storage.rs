@@ -3,12 +3,14 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+use crate::vector::bq::layered::{PlaneBatch, PlaneKey};
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::cache::WeakLanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
@@ -783,9 +785,35 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         )
     }
 
-    /// Warm all sign planes first, then high, then low. Backend admission enforces its byte budget.
-    pub async fn prewarm_planes(&self, cache: &lance_core::cache::WeakLanceCache) -> Result<()> {
-        use super::bq::layered::{PlaneBatch, PlaneKey};
+    /// Warm every plane entry. Backend admission enforces its byte budget.
+    ///
+    /// A backend that gates lower planes on their sign plane is warmed plane
+    /// by plane: all sign planes first, then the high and low planes of
+    /// partitions whose sign plane stayed resident. Other backends admit plane
+    /// entries like any entry, so they are warmed partition by partition,
+    /// which loads (and persists) every plane whatever fits in RAM, as the
+    /// native partition prewarm does.
+    pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
+        if !cache.plane_admission_gated() {
+            for part_id in 0..self.num_partitions() {
+                for plane in 0..=2 {
+                    cache
+                        .get_or_insert_with_key(
+                            PlaneKey {
+                                partition: part_id,
+                                plane,
+                            },
+                            || async {
+                                Ok(PlaneBatch(
+                                    self.read_plane(part_id, plane, None, None).await?,
+                                ))
+                            },
+                        )
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
         for plane in 0..=2 {
             for part_id in 0..self.num_partitions() {
                 if plane > 0
@@ -827,10 +855,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         &self,
         part_id: usize,
         precision: super::bq::layered::RQPrecision,
-        cache: &lance_core::cache::WeakLanceCache,
+        cache: &WeakLanceCache,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
-        use super::bq::layered::{PlaneBatch, PlaneKey, RQPrecision};
+        use super::bq::layered::RQPrecision;
         if !self.is_layered_rq() {
             if precision != RQPrecision::Full {
                 return Err(Error::invalid_input(
@@ -844,44 +872,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             RQPrecision::High => 1,
             RQPrecision::Full => 2,
         };
-        let load_plane = |plane| {
-            let io_stats = io_stats.clone();
-            async move {
-                let key = PlaneKey {
-                    partition: part_id,
-                    plane,
-                };
-                let sign_resident = plane == 0
-                    || cache
-                        .get_resident_with_key(&PlaneKey {
-                            partition: part_id,
-                            plane: 0,
-                        })
-                        .await
-                        .is_some();
-                let batch = if sign_resident {
-                    cache
-                        .get_or_insert_with_key_hit(key, || async {
-                            Ok(PlaneBatch(
-                                self.read_plane(part_id, plane, None, io_stats.clone())
-                                    .await?,
-                            ))
-                        })
-                        .await?
-                        .0
-                } else if let Some(batch) = cache.get_without_promotion_with_key(&key).await {
-                    batch
-                } else {
-                    // An oversized sign plane falls back to partition streaming; do
-                    // not admit smaller ex entries without their sign dependency.
-                    Arc::new(PlaneBatch(
-                        self.read_plane(part_id, plane, None, io_stats.clone())
-                            .await?,
-                    ))
-                };
-                Ok::<_, Error>(batch)
-            }
-        };
+        let load_plane = |plane| self.load_plane_entry(part_id, plane, cache, io_stats.clone());
         // Admit the sign dependency first. The high and low reads can then
         // overlap without changing admission policy or assembled column order.
         let sign = load_plane(0).await?;
@@ -907,6 +898,65 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.frag_reuse_index.is_none()
     }
 
+    /// Load one whole plane entry of a layered partition.
+    ///
+    /// A backend that gates lower planes on their sign plane admits a lower
+    /// plane only while the partition's sign plane is resident; otherwise the
+    /// plane is read without admission, from the persistent entry or the
+    /// origin file. Other backends admit every plane through their ordinary
+    /// policy, as native partitions are.
+    async fn load_plane_entry(
+        &self,
+        part_id: usize,
+        plane: u8,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Arc<PlaneBatch>> {
+        let key = PlaneKey {
+            partition: part_id,
+            plane,
+        };
+        if !cache.plane_admission_gated() {
+            return cache
+                .get_or_insert_with_key(key, || async {
+                    Ok(PlaneBatch(
+                        self.read_plane(part_id, plane, None, io_stats.clone())
+                            .await?,
+                    ))
+                })
+                .await;
+        }
+        let sign_resident = plane == 0
+            || cache
+                .get_resident_with_key(&PlaneKey {
+                    partition: part_id,
+                    plane: 0,
+                })
+                .await
+                .is_some();
+        let batch = if sign_resident {
+            cache
+                .get_or_insert_with_key_hit(key, || async {
+                    Ok(PlaneBatch(
+                        self.read_plane(part_id, plane, None, io_stats.clone())
+                            .await?,
+                    ))
+                })
+                .await?
+                .0
+        } else if let Some(batch) = cache.get_without_promotion_with_key(&key).await {
+            batch
+        } else {
+            // An oversized sign plane falls back to partition streaming; do
+            // not admit smaller ex entries without their sign dependency.
+            Arc::new(PlaneBatch(
+                self.read_plane(part_id, plane, None, io_stats.clone())
+                    .await?,
+            ))
+        };
+        Ok(batch)
+    }
+
     /// Assemble a full-precision store from candidate rows only.
     pub async fn load_candidates(
         &self,
@@ -915,7 +965,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         cache: &lance_core::cache::WeakLanceCache,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
-        use super::bq::layered::{PlaneKey, RQPrecision};
+        use super::bq::layered::RQPrecision;
         use super::bq::storage::{RABIT_CODE_COLUMN, take_packed_codes};
         use arrow_array::cast::AsArray;
         if rows.windows(2).any(|w| w[0] >= w[1]) {

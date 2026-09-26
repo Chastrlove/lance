@@ -390,6 +390,11 @@ impl LanceCache {
             .ok()
     }
 
+    /// Whether lower layered planes gate RAM admission on a resident sign plane.
+    pub fn plane_admission_gated(&self) -> bool {
+        self.state.backend.plane_admission_gated()
+    }
+
     /// Read memory or persistent storage without promoting a persistent hit.
     pub async fn get_without_promotion_with_key<K>(
         &self,
@@ -656,6 +661,12 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         self.upgrade()?.get_resident_with_key(cache_key).await
+    }
+
+    /// Whether lower layered planes gate RAM admission; a dropped cache keeps the default.
+    pub fn plane_admission_gated(&self) -> bool {
+        self.upgrade()
+            .is_none_or(|cache| cache.plane_admission_gated())
     }
 
     /// Read a cached candidate plane without whole-entry RAM admission.
@@ -1169,6 +1180,16 @@ mod tests {
             Some(&vec![2])
         );
         assert_eq!((cache.stats().await.hits, cache.size().await), (2, 2));
+    }
+
+    #[test]
+    fn plane_admission_gating_passes_through() {
+        let cache = LanceCache::with_capacity(4096);
+        let weak = WeakLanceCache::from(&cache);
+        assert!(cache.plane_admission_gated() && weak.plane_admission_gated());
+
+        drop(cache);
+        assert!(weak.plane_admission_gated());
     }
 
     #[tokio::test]

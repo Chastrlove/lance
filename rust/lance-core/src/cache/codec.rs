@@ -274,6 +274,7 @@ type RowDecoder = fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<ArcAny
 pub struct CacheCodec {
     row_decoder: Option<RowDecoder>,
     memory_priority: u8,
+    plane_tag: Option<u8>,
     type_id: &'static str,
     version: u32,
     serialize_body: fn(&ArcAny, &mut CacheEntryWriter<'_>) -> Result<()>,
@@ -322,6 +323,7 @@ impl CacheCodec {
         Self {
             row_decoder: None,
             memory_priority: 0,
+            plane_tag: None,
             type_id,
             version,
             serialize_body,
@@ -340,6 +342,7 @@ impl CacheCodec {
                 None
             },
             memory_priority: 0,
+            plane_tag: None,
             type_id: T::TYPE_ID,
             version: T::CURRENT_VERSION,
             serialize_body: serialize_via_impl::<T>,
@@ -355,6 +358,18 @@ impl CacheCodec {
 
     pub fn memory_priority(&self) -> u8 {
         self.memory_priority
+    }
+
+    /// Tag the entry as one plane of a layered index so backends can report
+    /// per-plane metrics without deriving the plane from an admission priority.
+    pub fn with_plane_tag(mut self, plane: u8) -> Self {
+        self.plane_tag = Some(plane);
+        self
+    }
+
+    /// The layered plane this entry belongs to, or `None` for other entries.
+    pub fn plane_tag(&self) -> Option<u8> {
+        self.plane_tag
     }
 
     /// Return the stable entry type identity.
@@ -618,6 +633,30 @@ mod tests {
             miss_reason(&Bytes::from(buf)),
             Some(CacheMissReason::BodyError)
         );
+    }
+
+    #[test]
+    fn plane_tag_is_metadata_only() {
+        let plain = CacheCodec::from_impl::<Widget>();
+        assert_eq!(plain.plane_tag(), None);
+
+        let tagged = plain.with_plane_tag(2).with_memory_priority(1);
+        assert_eq!(tagged.plane_tag(), Some(2));
+        assert_eq!(tagged.memory_priority(), 1);
+        let copied = tagged;
+        assert_eq!(copied.plane_tag(), Some(2));
+
+        // The tag never reaches the wire format.
+        let value: ArcAny = Arc::new(Widget { n: 11 });
+        let (mut plain_bytes, mut tagged_bytes) = (Vec::new(), Vec::new());
+        plain.serialize(&value, &mut plain_bytes).unwrap();
+        tagged.serialize(&value, &mut tagged_bytes).unwrap();
+        assert_eq!(plain_bytes, tagged_bytes);
+        let decoded = tagged
+            .deserialize(&Bytes::from(tagged_bytes))
+            .hit()
+            .unwrap();
+        assert_eq!(decoded.downcast_ref::<Widget>(), Some(&Widget { n: 11 }));
     }
 
     #[test]

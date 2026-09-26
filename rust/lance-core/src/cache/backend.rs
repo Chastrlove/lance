@@ -59,6 +59,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether layered index planes should gate lower-plane RAM admission on
+    /// their sign plane being resident. Backends that admit plane entries
+    /// through their ordinary policy return `false`, so lower planes are
+    /// loaded and admitted like any other entry.
+    fn plane_admission_gated(&self) -> bool {
+        true
+    }
+
     /// Read an entry without admitting a persistent hit into RAM.
     /// Backends without this capability safely fall back to resident entries.
     async fn get_without_promotion(
