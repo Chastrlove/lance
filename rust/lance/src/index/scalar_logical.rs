@@ -1482,14 +1482,14 @@ mod tests {
             arrow_array::RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(arrow_array::StringArray::from(vec![
-                    "alpha beta gamma",
-                    "beta gamma delta",
-                    "gamma delta epsilon",
-                    "delta epsilon zeta",
                     "epsilon zeta eta",
                     "zeta eta theta",
                     "eta theta iota",
                     "theta iota kappa",
+                    "alpha beta gamma",
+                    "beta gamma delta",
+                    "gamma delta epsilon",
+                    "delta epsilon zeta",
                 ]))],
             )
             .unwrap(),
@@ -1502,6 +1502,8 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
+        let surviving_fragment_id = fragments[0].id() as u32;
+        let rewritten_fragment_id = fragments[1].id() as u32;
 
         // Build per-fragment FM-Index segments and commit
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
@@ -1527,7 +1529,8 @@ mod tests {
             .unwrap();
         assert_eq!(committed.len(), 2);
 
-        // Delete rows from fragment 0 to trigger compaction retirement
+        // Delete rows from the trailing fragment so compaction leaves the
+        // leading indexed fragment's physical addresses intact.
         dataset.delete("text = 'alpha beta gamma'").await.unwrap();
         dataset.delete("text = 'beta gamma delta'").await.unwrap();
         crate::dataset::optimize::compact_files(
@@ -1547,12 +1550,13 @@ mod tests {
             .map(|f| f.id() as u32)
             .collect();
         assert!(
-            !live_frags.contains(0),
-            "compaction should retire fragment 0"
+            !live_frags.contains(rewritten_fragment_id),
+            "compaction should retire the trailing fragment"
         );
+        assert!(live_frags.contains(surviving_fragment_id));
 
-        // Merge: stable-row-ID index coverage should follow both the compacted
-        // fragment and the metadata-only relabeled trailing fragment.
+        // The surviving leading segment remains usable; the rewritten
+        // trailing segment cannot claim its new physical addresses.
         let segments = dataset
             .load_indices_by_name("text_fmindex_compact")
             .await
@@ -1563,7 +1567,7 @@ mod tests {
             .unwrap();
 
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(coverage, &live_frags);
+        assert_eq!(coverage, &RoaringBitmap::from_iter([surviving_fragment_id]));
 
         // Commit the merged segment and verify search works
         dataset
@@ -1599,7 +1603,7 @@ mod tests {
             "deleted rows from retired fragment should not appear in merged index"
         );
 
-        // "theta" exists in fragment 1 rows only
+        // "theta" exists in the surviving leading fragment.
         let query = lance_index::scalar::TextQuery::StringContains("theta".to_string());
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         let row_addrs = match result {

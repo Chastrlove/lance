@@ -3108,13 +3108,14 @@ mod tests {
     /// surviving half made the coverage look healthy.
     #[tokio::test]
     async fn test_merge_uncommitted_segments_partly_retired_by_compaction() {
-        // Two undersized fragments and one already at the compaction target, so
-        // compaction rewrites the pair and leaves the third alone.
+        // One fragment at the compaction target followed by two undersized
+        // fragments. Rewriting the trailing pair leaves the first fragment's
+        // staged coverage live without relabeling it.
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(2),
-                lance_datagen::BatchCount::from(2),
+                lance_datagen::RowCount::from(4),
+                lance_datagen::BatchCount::from(1),
             );
         let test_dir = tempfile::tempdir().unwrap();
         let dataset_uri = test_dir.path().to_str().unwrap();
@@ -3122,7 +3123,7 @@ mod tests {
             reader,
             dataset_uri,
             Some(WriteParams {
-                max_rows_per_file: 2,
+                max_rows_per_file: 4,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3132,15 +3133,15 @@ mod tests {
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(4),
-                lance_datagen::BatchCount::from(1),
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
             );
         let mut dataset = Dataset::write(
             reader,
             dataset_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                max_rows_per_file: 4,
+                max_rows_per_file: 2,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3172,8 +3173,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Two rows per fragment against a four-row target pairs some fragments
-        // and leaves at least one alone.
+        // Two trailing two-row fragments compact while the leading four-row
+        // fragment keeps its identity.
         crate::dataset::optimize::compact_files(
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
