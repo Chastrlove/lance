@@ -104,7 +104,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self},
 };
-use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
+use lance_arrow::json::convert_json_columns;
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
@@ -1594,9 +1594,11 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
-        // single batch that is larger than the memory pool, so we must
-        // rechunk oversized batches before they reach the sort.
+        // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
+        // sort overhead and spill/merge reservation. SortExec must reserve an
+        // entire input batch even when spilling is enabled. This cap reduces
+        // reservation pressure but cannot guarantee success with a small pool
+        // or competing consumers; oversized single rows are rejected.
         const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
         let sorted = session_ctx
             .read_one_shot(source)?
@@ -1604,7 +1606,7 @@ impl MergeInsertJob {
             .sort(vec![col(ROW_ADDR).sort(true, true)])?;
         let sorted_plan = sorted.create_physical_plan().await?;
         // Walk the physical plan and insert HardCapBatchSizeExec below every
-        // sort node so each input batch fits in the memory pool.
+        // sort node to enforce the input cap (deep-copying oversized slices).
         let capped_plan = sorted_plan
             .transform_down(|node| {
                 if node.downcast_ref::<SortExec>().is_some() {
@@ -1759,20 +1761,6 @@ impl MergeInsertJob {
                             }
                             Err(e) => Err(e),
                         })?;
-
-                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary/JSONB)
-                    // before writing. Without this, Utf8 data is written raw while the
-                    // schema says LargeBinary, causing decoder panics on subsequent reads.
-                    let needs_json_conversion = batches[0]
-                        .schema()
-                        .fields()
-                        .iter()
-                        .any(|f| is_arrow_json_field(f) || has_json_fields(f));
-                    if needs_json_conversion {
-                        for batch in batches.iter_mut() {
-                            *batch = convert_json_columns(batch).map_err(Error::from)?;
-                        }
-                    }
 
                     let source_version = metadata
                         .referenced_lance_files()
