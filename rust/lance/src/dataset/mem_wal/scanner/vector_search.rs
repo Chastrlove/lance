@@ -28,6 +28,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
@@ -81,6 +82,9 @@ pub struct LsmVectorSearchPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which resolves a generation's
+    /// stored columns to the table's.
+    identity_schema: SchemaRef,
     /// Vector column name.
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
@@ -106,6 +110,11 @@ pub struct LsmVectorSearchPlanner {
     /// Optional `lower <= _distance < upper` bound, applied inside every source
     /// arm's KNN so an out-of-range row never consumes a top-k slot.
     distance_range: (Option<f32>, Option<f32>),
+    /// Optional HNSW search-list size, forwarded to every arm. It bites on the
+    /// HNSW-backed ones — the active memtable's graph and each flushed
+    /// generation's `IVF_HNSW_SQ` — and is ignored by an arm whose index is not
+    /// a graph. `None` leaves each arm at its own default.
+    ef: Option<usize>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -128,6 +137,7 @@ impl LsmVectorSearchPlanner {
         Self {
             collector,
             pk_columns,
+            identity_schema: base_schema.clone(),
             base_schema,
             vector_column,
             distance_type,
@@ -138,6 +148,7 @@ impl LsmVectorSearchPlanner {
             warmer: None,
             filter: None,
             distance_range: (None, None),
+            ef: None,
         }
     }
 
@@ -155,6 +166,26 @@ impl LsmVectorSearchPlanner {
     /// row can't displace an in-range one.
     pub fn with_distance_range(mut self, lower: Option<f32>, upper: Option<f32>) -> Self {
         self.distance_range = (lower, upper);
+        self
+    }
+
+    /// Set the HNSW search-list size — the fresh tier's recall/latency knob.
+    ///
+    /// Not `nprobes`: flushed generations are written as single-partition IVF
+    /// and the memtable graph has no partitions at all, so a probe count has
+    /// nothing to probe on the fresh tier. `ef` is what widens the search.
+    pub fn with_ef(mut self, ef: Option<usize>) -> Self {
+        self.ef = ef;
+        self
+    }
+
+    /// The table's schema carrying each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    ///
+    /// Defaults to the base schema, so a caller that has no ids to give is
+    /// matched by name as it was.
+    pub fn with_identity_schema(mut self, schema: SchemaRef) -> Self {
+        self.identity_schema = schema;
         self
     }
 
@@ -267,7 +298,7 @@ impl LsmVectorSearchPlanner {
             &self.base_schema,
             &self.pk_columns,
             true, // include _distance — KNN always produces it
-        );
+        )?;
 
         // Refine the base table when explicitly requested, or whenever the base
         // is blocked (it then over-fetches its approximate-index candidates, so
@@ -297,16 +328,21 @@ impl LsmVectorSearchPlanner {
                 (source, is_base, is_active, blocked, fetch_k)
             })
             .collect();
+        // Type-erased, not merely boxed: the `Send` proof recurses through a
+        // boxed future's concrete type but stops at a trait object, and an arm
+        // resolves a generation's schema before it searches.
         let built = futures::future::try_join_all(arm_inputs.iter().map(
             |(source, is_base, _, _, fetch_k)| {
-                Box::pin(self.build_knn_plan(
-                    source,
-                    query_vector,
-                    *fetch_k,
-                    nprobes,
-                    projection,
-                    *is_base && refine_base,
-                ))
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_knn_plan(
+                        source,
+                        query_vector,
+                        *fetch_k,
+                        nprobes,
+                        projection,
+                        *is_base && refine_base,
+                    ));
+                arm
             },
         ))
         .await?;
@@ -435,7 +471,10 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // Native scanner prefilter: the ANN runs over rows matching
                     // the predicate, so the top-k holds only matching rows.
@@ -457,6 +496,9 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
+                if let Some(ef) = self.ef {
+                    scanner.ef(ef);
+                }
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
                 // Re-rank base candidates with exact distances so they're
@@ -476,23 +518,81 @@ impl LsmVectorSearchPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                let cols =
+                // Asked of this generation under its own names: a rename moved
+                // the table's name while the file still holds the old one, so
+                // projecting the table's names would ask for a column that is
+                // not there.
+                let asked_for =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                if let Some(ref filter) = self.filter {
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
+                );
+                // The index is on this generation's own column, under the name
+                // it had when the generation was sealed.
+                let Some(vector_column) = generation.stored_name(&self.vector_column) else {
+                    // The table dropped the column the search names, so this
+                    // generation has no candidates to offer.
+                    return self.empty_plan(projection);
+                };
+                let vector_column = vector_column.to_string();
+                // A predicate this generation cannot answer as written runs
+                // above the reconciliation, where the columns it names exist.
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
+                if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the top-k.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
-                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the search has chosen its
+                // top-k. Cutting to `k` first would drop rows that pass the
+                // predicate behind rows that do not, so this arm does not cut:
+                // it ranks everything it holds and lets the filter, and then
+                // the union's own top-k, decide. Only a generation the
+                // predicate cannot be translated against pays for this.
+                let k = match above {
+                    None => k,
+                    Some(_) => {
+                        let all = Box::pin(dataset.count_rows(None)).await?.max(1);
+                        // Logged because it is invisible otherwise: the query
+                        // is correct and simply slow, and the cause -- one
+                        // column this generation cannot be asked about under
+                        // its current name -- cannot be read off the query. It
+                        // clears when compaction folds the generation into base.
+                        log::warn!(
+                            "mem_wal vector search: ranking all {all} rows of a generation                              because a predicate could not be translated against it;                              requested k was {k}"
+                        );
+                        all
+                    }
+                };
+                scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
+                if let Some(ef) = self.ef {
+                    scanner.ef(ef);
+                }
                 scanner.fast_search();
-                scanner.create_plan().await
+                // Boxed for the reason the scan planner's arm gives: a
+                // generation resolves its own schema before scanning, and
+                // the inlined future is too deep for the `Send` proof.
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
+                match &above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -521,6 +621,9 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
+                if let Some(ef) = self.ef {
+                    scanner.ef(ef);
+                }
                 scanner.create_plan().await
             }
         }
@@ -530,7 +633,8 @@ impl LsmVectorSearchPlanner {
     fn empty_plan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let schema = canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true);
+        let schema =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true)?;
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }
@@ -793,6 +897,93 @@ mod tests {
 
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
+    }
+
+    /// `ef` is the fresh tier's only meaningful recall knob — its arms are
+    /// HNSW-backed, and probe counts have nothing to probe here. Before
+    /// `with_ef` the planner had no way to express it at all, so every
+    /// fresh-tier search ran at the graph default while the base arm honored
+    /// whatever the caller asked for.
+    #[tokio::test]
+    async fn with_ef_reaches_the_memtable_arm() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base_dataset =
+            Arc::new(create_dataset(&base_uri, vec![create_test_batch(&schema, &[10, 20])]).await);
+
+        let build_planner = || {
+            let batch_store = Arc::new(BatchStore::with_capacity(16));
+            let mut index_store = IndexStore::new();
+            index_store.enable_pk_index(&[("id".to_string(), 0)]);
+            index_store.add_hnsw(
+                "vector_hnsw".to_string(),
+                1,
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+                64,
+                8,
+            );
+            let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+            batch_store.append(batch.clone()).unwrap();
+            index_store
+                .insert_with_batch_position(&batch, 0, Some(0))
+                .unwrap();
+            let collector = LsmDataSourceCollector::new(base_dataset.clone(), vec![])
+                .with_in_memory_memtables(
+                    uuid::Uuid::new_v4(),
+                    InMemoryMemTables {
+                        active: InMemoryMemTableRef {
+                            batch_store,
+                            index_store: Arc::new(index_store),
+                            schema: schema.clone(),
+                            generation: 1,
+                        },
+                        frozen: vec![],
+                    },
+                );
+            LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+            )
+        };
+
+        let query = create_query_vector();
+        let render = |plan: Arc<dyn ExecutionPlan>| {
+            format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+            )
+        };
+
+        let defaulted = render(
+            build_planner()
+                .plan_search(&query, 3, 1, None, false, 1.0)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !defaulted.contains("ef="),
+            "unset ef must leave each arm at its own default: {defaulted}"
+        );
+
+        let widened = render(
+            build_planner()
+                .with_ef(Some(97))
+                .plan_search(&query, 3, 1, None, false, 1.0)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            widened.contains("ef=97"),
+            "with_ef must reach the memtable HNSW arm: {widened}"
+        );
     }
 
     #[tokio::test]

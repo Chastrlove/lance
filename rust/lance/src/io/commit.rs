@@ -43,6 +43,7 @@ use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
+use lance_table::transaction::{FragReuseUpdate, PreparedIndices};
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
@@ -84,6 +85,43 @@ mod s3_test;
 /// Wall-clock budget for conflict retry backoff when callers do not override it.
 pub(crate) const DEFAULT_COMMIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Env var overriding [`DEFAULT_COMMIT_RETRY_TIMEOUT`] process-wide, in
+/// (possibly fractional) seconds. A long-running maintenance commit (index
+/// build, compaction) can start from a read version that is hours old on a
+/// write-heavy table, and catching up through the intervening versions can
+/// need far more than the default budget; this is the operational escape
+/// hatch for callers that have no explicit-timeout API of their own.
+const COMMIT_RETRY_TIMEOUT_ENV: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
+
+/// The commit conflict-retry budget used when the caller does not set one:
+/// [`COMMIT_RETRY_TIMEOUT_ENV`] if set to a valid positive number of seconds,
+/// otherwise [`DEFAULT_COMMIT_RETRY_TIMEOUT`]. Read once per process.
+pub(crate) fn default_commit_retry_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_commit_retry_timeout(std::env::var(COMMIT_RETRY_TIMEOUT_ENV).ok().as_deref())
+    })
+}
+
+/// Parse [`COMMIT_RETRY_TIMEOUT_ENV`]'s value; `None` means unset. Anything
+/// that is not a finite positive number of seconds warns and falls back to
+/// [`DEFAULT_COMMIT_RETRY_TIMEOUT`].
+fn parse_commit_retry_timeout(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw else {
+        return DEFAULT_COMMIT_RETRY_TIMEOUT;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if secs.is_finite() && secs > 0.0 => Duration::from_secs_f64(secs),
+        _ => {
+            log::warn!(
+                "ignoring invalid {COMMIT_RETRY_TIMEOUT_ENV}={raw:?}; using the {}s default",
+                DEFAULT_COMMIT_RETRY_TIMEOUT.as_secs()
+            );
+            DEFAULT_COMMIT_RETRY_TIMEOUT
+        }
+    }
+}
+
 pub(crate) fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
     Error::too_much_write_contention(format!(
         "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
@@ -110,20 +148,31 @@ pub(crate) fn maybe_timeout<T>(
     }
 }
 
-/// Read the transaction data from a transaction file.
-pub(crate) async fn read_transaction_file(
+/// Read the raw protobuf transaction from a transaction file.
+async fn read_transaction_file_pb(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
-) -> Result<Transaction> {
+) -> Result<pb::Transaction> {
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
-    let transaction = pb::Transaction::decode(data)?;
-    transaction.try_into()
+    Ok(pb::Transaction::decode(data)?)
+}
+
+/// Read the transaction data from a transaction file.
+#[cfg(test)]
+pub(crate) async fn read_transaction_file(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction_file: &str,
+) -> Result<Transaction> {
+    read_transaction_file_pb(object_store, base_path, transaction_file)
+        .await?
+        .try_into()
 }
 
 /// Best-effort delete of a transaction file that is no longer needed.
@@ -197,6 +246,12 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 /// the complete transaction recorded in the manifest at `version` with this
 /// attempt's transaction.
 ///
+/// The comparison is done between durable (protobuf) forms: the in-memory
+/// [`Transaction`] can carry state that is intentionally not serialized
+/// (e.g. the frag reuse payload attached to a rewrite), so comparing the
+/// read-back transaction against the in-memory one would misclassify our own
+/// landed commit as foreign.
+///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
 async fn verify_commit_outcome(
@@ -211,6 +266,10 @@ async fn verify_commit_outcome(
         Read(Error),
     }
 
+    // Durable form of this attempt's transaction, matching what the commit
+    // path serialized.
+    let transaction_pb = pb::Transaction::from(transaction);
+
     let mut backoff = Backoff::default();
     let failure = loop {
         let failure = match try_read_manifest_at(object_store, commit_handler, base_path, version)
@@ -220,7 +279,7 @@ async fn verify_commit_outcome(
                 match read_manifest_transaction(object_store, base_path, &manifest, &location).await
                 {
                     Ok(Some(committed_transaction)) => {
-                        return if committed_transaction == *transaction {
+                        return if committed_transaction == transaction_pb {
                             CommitOutcome::Ours {
                                 manifest: Box::new(manifest),
                                 location,
@@ -275,7 +334,7 @@ async fn read_manifest_transaction(
     base_path: &Path,
     manifest: &Manifest,
     location: &ManifestLocation,
-) -> Result<Option<Transaction>> {
+) -> Result<Option<pb::Transaction>> {
     if let Some(position) = manifest.transaction_section {
         let reader = if let Some(size) = location.size {
             object_store
@@ -286,9 +345,9 @@ async fn read_manifest_transaction(
         };
         let transaction: pb::Transaction =
             lance_io::utils::read_message(reader.as_ref(), position).await?;
-        Transaction::try_from(transaction).map(Some)
+        Ok(Some(transaction))
     } else if let Some(transaction_file) = manifest.transaction_file.as_deref() {
-        read_transaction_file(object_store, base_path, transaction_file)
+        read_transaction_file_pb(object_store, base_path, transaction_file)
             .await
             .map(Some)
     } else {
@@ -386,6 +445,12 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+            source_store,
+            &source_manifest_location,
+            &source_manifest,
+        )
+        .await?;
         Some((source_store, source_manifest_location, source_manifest))
     } else {
         None
@@ -432,7 +497,17 @@ async fn do_commit_new_dataset(
                     .into_iter()
                     .map(|index_pb| {
                         let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = Some(new_base_id);
+                        if index.base_id.is_none() {
+                            // Same rule as the data files in
+                            // `Manifest::shallow_clone`: only the source's own
+                            // entries get the new base; entries already stamped
+                            // keep their ids, which carry over into the clone's
+                            // `base_paths` verbatim. A chained clone (clone of
+                            // a clone) must not restamp an origin-based index
+                            // onto the middle hop, where its files do not
+                            // exist.
+                            index.base_id = Some(new_base_id);
+                        }
                         Ok(index)
                     })
                     .collect::<Result<Vec<_>>>()?
@@ -692,6 +767,7 @@ async fn migrate_manifest(
     Ok(())
 }
 
+#[cfg(test)]
 fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     crate::dataset::versions::check_manifest_storage_version(manifest)
 }
@@ -716,6 +792,7 @@ fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn check_column_indices(manifest: &Manifest) -> Result<()> {
     crate::dataset::versions::validate_column_indices(manifest)
 }
@@ -1119,6 +1196,23 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // Detached commits skip the rebase pipeline, so a rewrite's transition
+    // intent would never be assembled or validated (a dummy intent plus a
+    // hand-built entry would satisfy the manifest chokepoint unvalidated).
+    // A detached manifest is also outside the main version chain, where an
+    // appended fragment-reuse history has no meaning. Reject both shapes
+    // outright.
+    if let Operation::Rewrite {
+        frag_reuse_index: Some(entry),
+        ..
+    } = &transaction.operation
+        && lance_table::system_index::frag_reuse::metadata::is_tagged(entry)
+    {
+        return Err(Error::not_supported(
+            "Detached commits cannot carry fragment reuse transition intent or a tagged \
+             fragment reuse entry; commit the rewrite on the main version chain",
+        ));
+    }
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -1145,6 +1239,7 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
+        let build_config = write_config.to_build_config();
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -1152,18 +1247,27 @@ pub(crate) async fn do_commit_detached_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    &write_config.to_build_config(),
+                    &build_config,
                     &transaction_file,
                     &dataset.manifest,
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
-                Some(dataset.manifest.as_ref()),
-                load_all_indices(dataset).await?.as_ref().clone(),
-                &transaction_file,
-                &write_config.to_build_config(),
-            )?,
+            _ => {
+                // Nothing is settled about a tagged fragment reuse entry
+                // on a detached commit: a tagged rewrite entry was refused
+                // above and a trim never commits detached.
+                let prepared =
+                    prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
+                        .await?;
+                transaction.build_manifest_prepared(
+                    Some(dataset.manifest.as_ref()),
+                    prepared,
+                    &transaction_file,
+                    &build_config,
+                    None,
+                )?
+            }
         };
 
         manifest.version = random_version;
@@ -1171,10 +1275,10 @@ pub(crate) async fn do_commit_detached_transaction(
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
         migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
-        // fix_schema and check_storage_version are just for sanity-checking and consistency
+        // Validate before the fragment-id check to preserve legacy migration
+        // diagnostics. Finalization repeats this at the manifest write boundary.
         fix_schema(&mut manifest)?;
-        check_storage_version(&mut manifest)?;
-        check_column_indices(&manifest)?;
+        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
         // while keeping its UUID, so anything it narrowed loses its position.
@@ -1319,7 +1423,51 @@ pub(crate) async fn commit_detached_transaction(
     .await
 }
 
-/// Load new transactions and sort them by version in ascending order (oldest to newest)
+/// Step one of a commit attempt (`Transaction::prepare_indices`): the index
+/// list as read from the manifest current at this attempt, and the prepared
+/// list an in-place column rewrite has already withdrawn or pruned. For such
+/// a rewrite on a table with a tagged fragment reuse history the entry's
+/// history is decoded here, once per attempt, so the preparation can walk
+/// the lineage without guessing; other operations never interpret the
+/// entry: an append must carry a history a newer writer recorded through
+/// untouched. `frag_reuse` is what the rebase settled about the entry for
+/// this attempt. Nothing flows back into `transaction`.
+async fn prepare_attempt(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    build_config: &lance_table::format::ManifestBuildConfig,
+    frag_reuse: FragReuseUpdate,
+) -> Result<PreparedIndices> {
+    let indices = load_all_indices(dataset).await?;
+    let may_rewrite_in_place = match &transaction.operation {
+        Operation::Update {
+            fields_modified, ..
+        } => !fields_modified.is_empty(),
+        Operation::Merge { .. } | Operation::DataReplacement { .. } => true,
+        _ => false,
+    };
+    let ledger = if may_rewrite_in_place {
+        match indices
+            .iter()
+            .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
+        {
+            Some(entry) => Some(Arc::new(
+                crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?,
+            )),
+            None => None,
+        }
+    } else {
+        None
+    };
+    transaction.prepare_indices(
+        Some(dataset.manifest.as_ref()),
+        indices.as_ref().clone(),
+        build_config,
+        ledger,
+        frag_reuse,
+    )
+}
+
 async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
@@ -1433,6 +1581,10 @@ pub(crate) async fn commit_transaction(
     });
 
     let mut transaction = transaction.clone();
+    // What a rewrite on a tagged fragment reuse history assembled for the
+    // attempt; handed to the manifest build, never written back into
+    // `transaction`.
+    let mut tagged_rewrite = None;
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
@@ -1465,12 +1617,15 @@ pub(crate) async fn commit_transaction(
 
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+            rebase.load_current_lineage(&dataset).await?;
 
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
-            transaction = rebase.finish(&dataset).await?;
+            let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
+            transaction = rebased;
+            tagged_rewrite = assembly;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
@@ -1496,27 +1651,40 @@ pub(crate) async fn commit_transaction(
                 "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
             ));
         }
-        // Build an up-to-date manifest from the transaction and current manifest
+        // Build an up-to-date manifest from the transaction and current
+        // manifest: prepare the index list against this attempt's manifest
+        // first, then build from the prepared result.
+        let build_config = write_config.to_build_config();
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
+                // A restore reinstates its snapshot's index list and entry
+                // whole; nothing is prepared or withdrawn a second time.
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
                     &dataset.base,
                     version,
-                    &write_config.to_build_config(),
+                    &build_config,
                     transaction_file,
                     &dataset.manifest,
                 )
                 .await?
             }
-            _ => transaction.build_manifest_with_read_version(
-                Some(dataset.manifest.as_ref()),
-                load_all_indices(&dataset).await?.as_ref().clone(),
-                transaction_file,
-                &write_config.to_build_config(),
-                read_version_state,
-            )?,
+            _ => {
+                let frag_reuse = match tagged_rewrite.take() {
+                    Some(assembly) => FragReuseUpdate::Rewrite(assembly),
+                    None => FragReuseUpdate::None,
+                };
+                let prepared =
+                    prepare_attempt(&dataset, &transaction, &build_config, frag_reuse).await?;
+                transaction.build_manifest_prepared(
+                    Some(dataset.manifest.as_ref()),
+                    prepared,
+                    transaction_file,
+                    &build_config,
+                    read_version_state,
+                )?
+            }
         };
 
         manifest.version = target_version;
@@ -1532,8 +1700,7 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
-        check_storage_version(&mut manifest)?;
-        check_column_indices(&manifest)?;
+        crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
 
         // Runs after the coverage derivation and can replace a fragment bitmap
@@ -1729,6 +1896,8 @@ mod tests {
     use lance_file::version::ConcreteFileVersion;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
@@ -1743,6 +1912,20 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[rstest::rstest]
+    #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::whole_seconds(Some("600"), Duration::from_secs(600))]
+    #[case::fractional_and_padded(Some(" 2.5 "), Duration::from_secs_f64(2.5))]
+    #[case::empty(Some(""), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::not_a_number(Some("abc"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::zero(Some("0"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::negative(Some("-5"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::infinite(Some("inf"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::nan(Some("NaN"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    fn test_parse_commit_retry_timeout(#[case] raw: Option<&str>, #[case] expected: Duration) {
+        assert_eq!(parse_commit_retry_timeout(raw), expected);
+    }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
@@ -2925,6 +3108,255 @@ mod tests {
         )
     }
 
+    fn make_storage_contract_manifest(
+        fallback: ConcreteFileVersion,
+        file_versions: &[ConcreteFileVersion],
+    ) -> Manifest {
+        let files = file_versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| {
+                DataFile::new(
+                    format!("data-{index}.lance"),
+                    vec![],
+                    vec![],
+                    *version,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let fragment = Fragment {
+            id: 0,
+            files,
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        Manifest::new(
+            Schema::default(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(fallback),
+            HashMap::new(),
+        )
+    }
+
+    fn enable_mixed_file_versions(manifest: &mut Manifest) {
+        manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+    }
+
+    #[test]
+    fn storage_contract_accepts_all_exact_v2_combinations() {
+        let versions = [
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3,
+        ];
+        for fallback in versions {
+            for other in versions {
+                let mut manifest = make_storage_contract_manifest(fallback, &[fallback, other]);
+                enable_mixed_file_versions(&mut manifest);
+                check_storage_version(&mut manifest).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn storage_contract_requires_capability_for_non_fallback_file() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V2_1]);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("not enabled"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_finalization_derives_capability() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V2_0,
+            &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_2],
+        );
+
+        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+
+        assert_ne!(
+            manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        check_storage_version(&mut manifest).unwrap();
+    }
+
+    #[test]
+    fn storage_contract_finalization_rejects_v1_non_fallback() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_1, &[ConcreteFileVersion::V1]);
+
+        let err =
+            crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("cannot be mixed"), "{err}");
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+    }
+
+    #[test]
+    fn storage_contract_checks_overlay_versions() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V2_0]);
+        manifest.fragments = Arc::new(vec![Fragment {
+            overlays: vec![DataOverlayFile {
+                data_file: DataFile::new(
+                    "overlay.lance",
+                    vec![],
+                    vec![],
+                    ConcreteFileVersion::V2_2,
+                    None,
+                    None,
+                ),
+                coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0])),
+                committed_version: 1,
+            }],
+            ..manifest.fragments[0].clone()
+        }]);
+
+        assert!(check_storage_version(&mut manifest).is_err());
+        enable_mixed_file_versions(&mut manifest);
+        check_storage_version(&mut manifest).unwrap();
+    }
+
+    #[test]
+    fn storage_contract_rejects_v1_v2_mixing_even_with_capability() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V2_0,
+            &[ConcreteFileVersion::V1, ConcreteFileVersion::V2_0],
+        );
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("mixes V1 and V2"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_rejects_unknown_file_identity() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V2_0]);
+        Arc::make_mut(&mut manifest.fragments)[0].files[0].file_major_version = 99;
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_preserves_uniform_legacy_repair() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V1,
+            &[ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_1],
+        );
+
+        check_storage_version(&mut manifest).unwrap();
+
+        assert_eq!(
+            manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+
+        crate::dataset::versions::finalize_manifest_storage_version(&mut manifest).unwrap();
+
+        assert_eq!(
+            manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_1
+        );
+    }
+
+    #[test]
+    fn storage_contract_does_not_extend_legacy_repair_to_mixed_v2() {
+        let mut manifest = make_storage_contract_manifest(
+            ConcreteFileVersion::V1,
+            &[ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_1],
+        );
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(matches!(err, Error::Internal { .. }));
+        assert!(
+            err.to_string().contains("mixture of file versions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn storage_contract_rejects_v1_files_with_capability() {
+        let mut manifest =
+            make_storage_contract_manifest(ConcreteFileVersion::V2_0, &[ConcreteFileVersion::V1]);
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("references V1"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_rejects_empty_v1_fallback_with_capability() {
+        let mut manifest = make_storage_contract_manifest(ConcreteFileVersion::V1, &[]);
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("requires a V2 default"), "{err}");
+    }
+
+    #[test]
+    fn storage_contract_validates_column_indices_per_file_version() {
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let mut manifest = make_manifest_with_file(
+            Schema {
+                fields: vec![struct_field],
+                metadata: Default::default(),
+            },
+            data_file,
+            LanceFileVersion::V2_0,
+        );
+        enable_mixed_file_versions(&mut manifest);
+
+        let err = check_storage_version(&mut manifest).unwrap_err();
+
+        assert!(err.to_string().contains("Non-leaf field"), "{err}");
+    }
+
     #[test]
     fn test_check_column_indices_rejects_struct_with_column() {
         // Struct (non-leaf) field with column_index=0 in v2.1 should be rejected.
@@ -3320,5 +3752,54 @@ mod tests {
             index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
         ];
         assert!(detect_overlapping_fragments(&disjoint).is_ok());
+    }
+
+    /// Commit-outcome verification must compare durable (protobuf) forms.
+    ///
+    /// A rewrite's frag reuse payload is intentionally dropped by
+    /// serialization and restored as `None` on read, so the in-memory
+    /// transaction never equals its own read-back form. Comparing durable
+    /// forms classifies the landed commit as ours anyway.
+    #[test]
+    fn test_frag_reuse_rewrite_own_commit_comparison_uses_durable_form() {
+        use lance_table::transaction::Operation;
+
+        let entry = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 42,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let transaction = Transaction::new(
+            42,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(entry),
+            },
+            None,
+        );
+        // What the commit wrote, and what verification reads back.
+        let durable = pb::Transaction::from(&transaction);
+        let read_back = pb::Transaction::decode(durable.encode_to_vec().as_slice()).unwrap();
+        // The old comparison (read-back deserialized into memory, compared
+        // with `Transaction::eq`) misclassifies our own landed commit: the
+        // round trip loses the payload.
+        assert_ne!(
+            Transaction::try_from(read_back.clone()).unwrap(),
+            transaction,
+            "the round-tripped transaction must differ in memory (frag_reuse_index is not serialized); \
+             if this starts holding, the durable-form comparison is merely redundant"
+        );
+        // The comparison `verify_commit_outcome` performs: read-back durable
+        // form against the regenerated durable form of this attempt.
+        assert_eq!(read_back, pb::Transaction::from(&transaction));
     }
 }
