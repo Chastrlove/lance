@@ -149,6 +149,7 @@ class CleanupStats:
     transaction_files_removed: int
     index_files_removed: int
     deletion_files_removed: int
+    failed_deletes: int
 
 class CleanupCandidateFile:
     path: str
@@ -356,6 +357,8 @@ class LanceBlobFile:
     def read_range(self, offset: int, length: int) -> bytes: ...
     def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
+    def set_buffer_size(self, buffer_size: int) -> None: ...
+    def _range_submission_count(self) -> int: ...
 
 class _Dataset:
     @property
@@ -386,6 +389,7 @@ class _Dataset:
     def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
+    def base_paths(self) -> Dict[int, DatasetBasePath]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
     def remap_row_addrs(self, addrs: pa.Array) -> Optional[pa.Array]: ...
     def scanner(
@@ -420,6 +424,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -649,6 +656,24 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def find_duplicate_pairs(
+        self,
+        column: str,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
+    def find_duplicate_pairs_in_partition(
+        self,
+        column: str,
+        segment_id: str,
+        partition_id: int,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(
         self,
         index_name: str,
@@ -1013,6 +1038,14 @@ class DatasetBasePath:
         is_dataset_root: bool = False,
         id: Optional[int] = None,
     ) -> None: ...
+    @property
+    def id(self) -> int: ...
+    @property
+    def name(self) -> Optional[str]: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def is_dataset_root(self) -> bool: ...
 
 __version__: str
 language_model_home: Callable[[], str]
