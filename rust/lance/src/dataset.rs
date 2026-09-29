@@ -3422,7 +3422,8 @@ impl Dataset {
             .with_object_store(target_store.clone())
             .with_source_store(src_ds.object_store.clone())
             .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .with_deep_clone_files_copied();
         let new_ds = builder.execute(txn).await?;
         Ok(new_ds)
     }
@@ -4155,6 +4156,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            spilled_row_lineage: Default::default(),
         }
     }
 }

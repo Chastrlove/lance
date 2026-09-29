@@ -36,14 +36,15 @@ use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
+    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
-use lance_table::transaction::{FragReuseUpdate, PreparedIndices};
+use lance_table::transaction::{FragReuseUpdate, PreparedIndices, has_writer_placed_lineage};
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
@@ -51,6 +52,7 @@ use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
@@ -1255,7 +1257,7 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
-        let build_config = write_config.to_build_config();
+        let build_config = build_config_for_attempt(dataset, transaction, write_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -1437,6 +1439,43 @@ pub(crate) async fn commit_detached_transaction(
         retry_timeout,
     )
     .await
+}
+
+/// The build config for one commit attempt against `dataset`'s current manifest.
+///
+/// An operation that carries rows' lineage over from existing fragments needs
+/// their sequences at build time, and the build cannot read the ones spilled to
+/// data files; they are read here, per attempt, so a rebase onto a newer
+/// manifest sees that manifest's fragments.
+async fn build_config_for_attempt(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+) -> Result<ManifestBuildConfig> {
+    let mut config = write_config.to_build_config();
+    let reads_existing_lineage = match &transaction.operation {
+        // An update resolves its new fragments' created-at versions from the
+        // existing fragments unless their writer placed them, and refreshes
+        // the existing last-updated-at versions of the offsets it rewrote in
+        // place (`updated_fragment_offsets`).
+        Operation::Update {
+            new_fragments,
+            updated_fragment_offsets,
+            ..
+        } => {
+            !new_fragments.iter().all(has_writer_placed_lineage)
+                || updated_fragment_offsets
+                    .as_ref()
+                    .is_some_and(|offsets| !offsets.0.is_empty())
+        }
+        Operation::DataOverlay { .. } => true,
+        _ => false,
+    };
+    if reads_existing_lineage {
+        config.spilled_row_lineage =
+            load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+    }
+    Ok(config)
 }
 
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
@@ -1670,7 +1709,7 @@ pub(crate) async fn commit_transaction(
         // Build an up-to-date manifest from the transaction and current
         // manifest: prepare the index list against this attempt's manifest
         // first, then build from the prepared result.
-        let build_config = write_config.to_build_config();
+        let build_config = build_config_for_attempt(&dataset, &transaction, write_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 // A restore reinstates its snapshot's index list and entry

@@ -1516,6 +1516,7 @@ mod tests {
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
@@ -2017,8 +2018,34 @@ mod tests {
                     .unwrap(),
             );
         }
+        let version_before = dataset.version().version;
+        let error = dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(dataset.version().version, version_before);
+        assert!(
+            dataset
+                .load_indices_by_name(INDEX_NAME)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Bypass commit-time validation only to exercise append's independent guard
+        // against an incompatible segment set already present in the manifest.
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: segments,
+                removed_indices: vec![],
+            },
+            None,
+        );
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", segments)
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await
             .unwrap();
 
