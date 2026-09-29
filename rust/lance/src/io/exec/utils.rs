@@ -1047,8 +1047,7 @@ mod tests {
 
     use super::{
         FilteredRowIdsToPrefilter, InstrumentedChildInputStream, PreFilterSource, ReplayExec,
-        SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
-        shared_prefilter_future,
+        SharedPreFilterExec, SharedPreFilterMaterialization, shared_prefilter_future,
     };
 
     #[tokio::test]
@@ -1413,14 +1412,19 @@ mod tests {
                 .field_sources
                 .iter()
                 .map(|source| {
-                    prefilter_mask_future(
+                    let PreFilterSource::FilteredRowIds(node) = source else {
+                        panic!("a filtered MultiMatch field shares a row-id prefilter");
+                    };
+                    let shared = node
+                        .downcast_ref::<SharedPreFilterExec>()
+                        .expect("MultiMatch fields share one SharedPreFilterExec");
+                    Ok(shared_prefilter_future(
+                        shared.materialization.clone(),
+                        shared.source.clone(),
+                        false,
                         ctx.clone(),
                         0,
-                        source,
-                        None,
-                        &ExecutionPlanMetricsSet::new(),
-                    )
-                    .map(|mask| mask.expect("a filtered MultiMatch field loads a prefilter"))
+                    ))
                 })
                 .collect::<lance_core::Result<Vec<_>>>();
             let schema = self.schema.clone();
