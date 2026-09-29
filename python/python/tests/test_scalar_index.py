@@ -26,6 +26,7 @@ from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
+    CombinedFieldsQuery,
     DocumentGranularity,
     FullTextOperator,
     MatchQuery,
@@ -2093,6 +2094,65 @@ def test_fts_multi_match_query(tmp_path):
         tmp_path,
         index_params={"with_position": False},
     )
+
+
+@pytest.mark.parametrize(
+    "operator,combined_ids,multi_ids",
+    [
+        # combined_fields treats the columns as one virtual field, so AND matches
+        # when each term appears in any field (rows 0 and 1); best_fields AND only
+        # matches row 1, where a single field holds both terms.
+        (FullTextOperator.AND, {0, 1}, {1}),
+        (FullTextOperator.OR, {0, 1, 2}, {0, 1, 2}),
+    ],
+)
+def test_fts_combined_fields_query(tmp_path, operator, combined_ids, multi_ids):
+    data = pa.table(
+        {
+            "id": [0, 1, 2],
+            # row 0 splits the terms across fields, row 1 has both in one field,
+            # row 2 has only "john".
+            "title": ["john", "john smith", "john"],
+            "body": ["smith", "foo", "alice"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("body", "INVERTED")
+
+    def ids(query):
+        return set(ds.to_table(full_text_query=query, columns=["id"])["id"].to_pylist())
+
+    assert (
+        ids(CombinedFieldsQuery("john smith", ["title", "body"], operator=operator))
+        == combined_ids
+    )
+    assert (
+        ids(MultiMatchQuery("john smith", ["title", "body"], operator=operator))
+        == multi_ids
+    )
+
+
+def test_fts_combined_fields_boost_validation(tmp_path):
+    # Per-column boosts must be >= 1 (Lucene CombinedFieldQuery constraint), and
+    # the boost count must match the column count.
+    data = pa.table({"title": ["hello"], "body": ["world"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("body", "INVERTED")
+
+    with pytest.raises(ValueError, match="boost"):
+        CombinedFieldsQuery("hello", ["title", "body"], boosts=[0.5, 1.0])
+    with pytest.raises(ValueError):
+        CombinedFieldsQuery("hello", ["title", "body"], boosts=[1.0])
+
+    # Fractional weights >= 1 are accepted.
+    result = ds.to_table(
+        full_text_query=CombinedFieldsQuery(
+            "hello", ["title", "body"], boosts=[1.5, 1.0]
+        )
+    )
+    assert result.num_rows == 1
 
 
 def test_fts_boolean_query(tmp_path):
@@ -5730,6 +5790,12 @@ def test_scan_statistics_callback(tmp_path):
     assert isinstance(scan_stats.parts_loaded, int)
     assert isinstance(scan_stats.index_comparisons, int)
     assert isinstance(scan_stats.all_counts, dict)
+    assert isinstance(scan_stats.all_times, dict)
+    for key, value in scan_stats.all_times.items():
+        assert isinstance(key, str)
+        assert isinstance(value, int)
+        assert value >= 0
+    assert "all_times=" in repr(scan_stats)
 
     # Verify we got some I/O activity
     assert scan_stats.iops > 0, "Expected some I/O operations"
@@ -6426,7 +6492,9 @@ def test_vector_filter_fts_search(tmp_path):
         prefilter=False, nearest=vector_query, filter=MatchQuery("text", "text")
     )
     result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
+    # The approximate IVF_PQ index can return the two nearest "text" matches
+    # (299 and 300) in either order, so assert the set of ids, not the order.
+    assert sorted(result["id"].to_pylist()) == [299, 300]
 
     # Case 2: search with prefilter=true, search_filter=match("text"),
     #         filter="category='geography'"
@@ -6448,7 +6516,9 @@ def test_vector_filter_fts_search(tmp_path):
         filter=MatchQuery("text", "text"),
     )
     result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
+    # The approximate IVF_PQ index can return the two nearest "text" matches
+    # (299 and 300) in either order, so assert the set of ids, not the order.
+    assert sorted(result["id"].to_pylist()) == [299, 300]
 
     # Case 4: search with prefilter=false, search_filter=match("text"),
     #       filter="category='geography'"

@@ -991,6 +991,13 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def combined_fields_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     """Statistics about a scan operation."""
@@ -1029,6 +1036,11 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+    all_times: Dict[str, int]
+    """Additional debugging timings in nanoseconds. Keys are subject to change.
+
+    Nested and concurrent stages overlap; summing these values does not
+    reconstruct query wall time."""
 
 class DatasetBasePath:
     def __init__(

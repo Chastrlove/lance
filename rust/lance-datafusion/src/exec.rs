@@ -512,6 +512,9 @@ pub struct ExecutionSummaryCounts {
     /// that construct or destructure it. Prefer the typed accessors below.
     pub all_counts: HashMap<String, usize>,
     /// Additional time metrics for more detailed statistics, stored in nanoseconds.
+    /// Operator baseline times use `<ExecutionPlan::name()>_elapsed_compute` keys.
+    /// Timings may be nested and accumulate across concurrent work; they are not
+    /// exclusive stages that can be added to recover query wall time.
     /// These are subject to change in the future and should only be used for debugging purposes.
     pub all_times: HashMap<String, usize>,
 }
@@ -613,6 +616,14 @@ pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut Executio
                 .entry(metric_name.as_ref().to_string())
                 .or_insert(0);
             *existing += time.value();
+        }
+        // Keep operator baselines separate: ANN elapsed time includes asynchronous waits,
+        // while operators such as SortExec report compute time. Summing them hides the stages.
+        if let Some(elapsed) = metrics.elapsed_compute() {
+            *counts
+                .all_times
+                .entry(format!("{}_elapsed_compute", node.name()))
+                .or_default() += elapsed;
         }
         // Include gauge-based I/O metrics (some nodes record I/O as gauges)
         for (metric_name, gauge) in metrics.iter_gauges() {

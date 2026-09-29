@@ -742,6 +742,92 @@ impl InvertedPartition {
         Ok((num_rows, row_freqs))
     }
 
+    /// This partition's share of `stale_rows`, counted the same way
+    /// [`Self::row_stats_for_terms`] counts the whole partition, so the caller can
+    /// subtract one from the other.
+    ///
+    /// Rows this partition holds no document for are skipped, so it is fine to pass
+    /// rows that live elsewhere.
+    pub(super) async fn stale_row_stats_for_terms(
+        &self,
+        terms: &[String],
+        stale_rows: &RowAddrTreeMap,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        let mut row_freqs = vec![0usize; terms.len()];
+        let Some(addresses) = stale_rows.row_addrs() else {
+            // A whole-fragment marker names no row to look up in a posting list.
+            return Err(Error::invalid_input(
+                "FTS corpus statistics cannot subtract overlay-stale rows named by whole fragments"
+                    .to_string(),
+            ));
+        };
+        let docs = self.docs.address_keyed().await?;
+        let mut total_tokens = 0u64;
+        let mut stale = RoaringTreemap::new();
+        for address in addresses {
+            let address = u64::from(address);
+            let doc_length = docs.doc_length_at(address);
+            if doc_length == 0 {
+                continue;
+            }
+            total_tokens += doc_length;
+            stale.insert(address);
+        }
+        if stale.is_empty() {
+            return Ok((0, 0, row_freqs));
+        }
+        let is_legacy = self.is_legacy();
+        // The stale rows' DocIds, ascending, with the row address each belongs to.
+        // Resolved once so a compressed posting list can be probed for just these
+        // documents instead of being decoded and mapped back to addresses in full.
+        let resolve_stale_docs = || -> Option<(Vec<u32>, Vec<u64>)> {
+            let mut pairs = Vec::with_capacity(stale.len() as usize);
+            for address in stale.iter() {
+                pairs.extend(docs.doc_ids_at(address)?.map(|doc_id| (doc_id, address)));
+            }
+            pairs.sort_unstable();
+            Some(pairs.into_iter().unzip())
+        };
+        let stale_docs = if is_legacy {
+            None
+        } else {
+            resolve_stale_docs()
+        };
+        for (slot, term) in terms.iter().enumerate() {
+            let Some(token_id) = self.tokens.get(term) else {
+                continue;
+            };
+            // Whether a row held the term before the overlay is only visible in the
+            // posting list itself, so this reads it rather than taking the
+            // `posting_len_for_token` count the unrestricted path uses.
+            let posting = self
+                .inverted_list
+                .posting_list(token_id, false, metrics.unwrap_or(&NoOpMetricsCollector))
+                .await?;
+            let mut rows = RoaringTreemap::new();
+            match (&posting, &stale_docs) {
+                (PostingList::Compressed(posting), Some((doc_ids, addresses))) => {
+                    for (address, contained) in addresses.iter().zip(posting.contains_each(doc_ids))
+                    {
+                        if contained {
+                            rows.insert(*address);
+                        }
+                    }
+                }
+                _ => {
+                    for (row_id, _) in live_posting_rows(&posting, &docs, is_legacy) {
+                        if stale.contains(row_id) {
+                            rows.insert(row_id);
+                        }
+                    }
+                }
+            }
+            row_freqs[slot] = rows.len() as usize;
+        }
+        Ok((total_tokens, stale.len() as usize, row_freqs))
+    }
+
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,

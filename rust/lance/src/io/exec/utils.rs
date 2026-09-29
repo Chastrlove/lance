@@ -6,7 +6,7 @@ use lance_datafusion::utils::{
     INDEX_CACHE_MISSES_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
     PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{IndexTiming, MetricsCollector};
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
@@ -202,6 +202,7 @@ impl ExecutionPlan for SharedPreFilterExec {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct PreFilterMasks {
     pub overlay_block: Option<RowAddrMask>,
     pub external_mask: Option<Arc<RowAddrMask>>,
@@ -476,14 +477,21 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     fragments: RoaringBitmap,
-    external_mask: Option<Arc<RowAddrMask>>,
+    masks: PreFilterMasks,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Arc<DatasetPreFilter>> {
-    let filter =
-        prefilter_mask_future(context, partition, prefilter_source, external_mask, metrics)?;
-    Ok(Arc::new(DatasetPreFilter::new_restricted_to_fragments(
-        ds, fragments, filter,
-    )))
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+    )?;
+    let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
+    if let Some(overlay_block) = masks.overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
 }
 
 struct RowIdPrefilterMetrics {
@@ -994,6 +1002,7 @@ impl IoMetrics {
 
 #[derive(Clone)]
 pub struct IndexMetrics {
+    timings: [Time; IndexTiming::ALL.len()],
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
@@ -1010,6 +1019,7 @@ pub struct IndexMetrics {
 impl IndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
+            timings: IndexTiming::ALL.map(|stage| metrics.new_time(stage.name(), partition)),
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
@@ -1030,6 +1040,10 @@ impl IndexMetrics {
 }
 
 impl MetricsCollector for IndexMetrics {
+    fn record_timing(&self, stage: IndexTiming, duration: std::time::Duration) {
+        self.timings[stage as usize].add_duration(duration);
+    }
+
     fn record_parts_loaded(&self, num_shards: usize) {
         self.parts_loaded.add(num_shards);
     }
@@ -1053,7 +1067,9 @@ impl MetricsCollector for IndexMetrics {
 #[cfg(test)]
 mod tests {
 
+    use lance_index::metrics::{IndexTiming, LocalMetricsCollector, MetricsCollector};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
     use arrow_schema::{DataType, Field, Schema, SortOptions};
@@ -1081,6 +1097,30 @@ mod tests {
         FilteredRowIdsToPrefilter, InstrumentedChildInputStream, PreFilterSource, ReplayExec,
         SharedPreFilterExec, SharedPreFilterMaterialization, shared_prefilter_future,
     };
+
+    #[test]
+    fn test_index_stage_timings() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let collector = super::IndexMetrics::new(&metrics, 0);
+        let local = LocalMetricsCollector::default();
+        for stage in IndexTiming::ALL {
+            local.record_timing(stage, Duration::from_nanos(7));
+            collector
+                .clone()
+                .record_timing(stage, Duration::from_nanos(11));
+        }
+        local.dump_into(&collector);
+        for stage in IndexTiming::ALL {
+            assert_eq!(
+                metrics
+                    .clone_inner()
+                    .sum_by_name(stage.name())
+                    .unwrap()
+                    .as_usize(),
+                18
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_row_id_prefilter_metrics() {
