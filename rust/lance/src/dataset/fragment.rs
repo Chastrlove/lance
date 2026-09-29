@@ -52,7 +52,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, Fragment, RowDatasetVersionMeta};
+use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
@@ -65,7 +65,7 @@ use roaring::RoaringBitmap;
 use self::write::FragmentCreateBuilder;
 
 use super::hash_joiner::HashJoiner;
-use super::rowids::load_row_id_sequence;
+use super::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
 use super::scanner::Scanner;
 
 use super::updater::Updater;
@@ -625,6 +625,23 @@ impl NullReader {
         Self { schema, num_rows }
     }
 
+    /// The Arrow schema of the placeholder batches for `projection`.
+    ///
+    /// When a nested child is added to an existing parent, the parent lands
+    /// here as well (all-null) even though the dataset schema may declare it
+    /// NOT NULL; the later merge with the data files rebuilds it from the
+    /// parent's real data. Mark the placeholder fields nullable so the batch
+    /// is not rejected for violating a constraint the merged result satisfies.
+    fn nullable_schema(projection: &Schema) -> Arc<ArrowSchema> {
+        let schema = ArrowSchema::from(projection);
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>();
+        Arc::new(ArrowSchema::new_with_metadata(fields, schema.metadata))
+    }
+
     fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> RecordBatch {
         let columns = projection
             .fields()
@@ -652,7 +669,7 @@ impl GenericFileReader for NullReader {
         projection: Arc<Schema>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
+        let projection = Self::nullable_schema(projection.as_ref());
 
         let task_iter = std::iter::from_fn(move || {
             if remaining_rows == 0 {
@@ -1155,33 +1172,44 @@ impl FileFragment {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
 
-        // The reader builders below decode version sequences from the manifest
-        // and fall back to version 1 when they cannot; a spilled sequence must
-        // not fall through to that.
-        for (wanted, meta) in [
-            (
-                read_config.with_row_created_at_version,
-                &self.metadata.created_at_version_meta,
-            ),
-            (
-                read_config.with_row_last_updated_at_version,
-                &self.metadata.last_updated_at_version_meta,
-            ),
-        ] {
-            if wanted && matches!(meta, Some(RowDatasetVersionMeta::Column)) {
-                return Err(Error::not_supported(format!(
-                    "row versions of fragment {} are spilled to a data file column, which \
-                     this build cannot read",
-                    self.id()
-                )));
+        let version_load = |kind: RowVersionKind, wanted: bool| {
+            if wanted {
+                futures::future::Either::Left(load_row_version_sequence(
+                    &self.dataset,
+                    &self.metadata,
+                    kind,
+                ))
+            } else {
+                futures::future::Either::Right(futures::future::ready(Ok(None)))
             }
-        }
+        };
+        let last_updated_at_load = version_load(
+            RowVersionKind::LastUpdatedAt,
+            read_config.with_row_last_updated_at_version,
+        );
+        let created_at_load = version_load(
+            RowVersionKind::CreatedAt,
+            read_config.with_row_created_at_version,
+        );
 
-        let (opened_files, deletion_vec, row_id_sequence) =
-            join!(open_files, deletion_vec_load, row_id_load);
+        let (
+            opened_files,
+            deletion_vec,
+            row_id_sequence,
+            last_updated_at_sequence,
+            created_at_sequence,
+        ) = join!(
+            open_files,
+            deletion_vec_load,
+            row_id_load,
+            last_updated_at_load,
+            created_at_load
+        );
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
+        let last_updated_at_sequence = last_updated_at_sequence?;
+        let created_at_sequence = created_at_sequence?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -1224,10 +1252,10 @@ impl FileFragment {
             reader.with_row_address();
         }
         if read_config.with_row_last_updated_at_version {
-            reader.with_row_last_updated_at_version();
+            reader.with_row_last_updated_at_version(last_updated_at_sequence);
         }
         if read_config.with_row_created_at_version {
-            reader.with_row_created_at_version();
+            reader.with_row_created_at_version(created_at_sequence);
         }
 
         Ok(reader)
@@ -1726,7 +1754,10 @@ impl FileFragment {
     /// Verifies:
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
-    /// * All data files exist and have the same length
+    /// * All data files holding user data exist and have the same length. A
+    ///   file kept only for the spilled row lineage it carries is not opened;
+    ///   [`Dataset::validate`] reads that lineage back, which checks its
+    ///   length.
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
@@ -1793,7 +1824,29 @@ impl FileFragment {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
-        let get_lengths = self.metadata.files.iter().map(|data_file| async move {
+        // A file that holds no field of the dataset schema is not opened when
+        // it holds no user field at all, or when the fragment keeps it for a
+        // spilled row lineage sequence it carries -- a data file whose user
+        // columns were all dropped or replaced after compaction wrote the
+        // lineage next to them. The sequences it carries are checked against
+        // `physical_rows` when they are validated. Any other file is opened,
+        // so a file listing only user fields the schema does not have is
+        // still reported.
+        let schema_field_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        let spilled_field_ids = self.metadata.spilled_row_lineage_field_ids();
+        let user_data_files = self.metadata.files.iter().filter(|data_file| {
+            let fields = &data_file.fields;
+            let holds_schema_field = fields.iter().any(|id| schema_field_ids.contains(id));
+            let holds_user_field = fields.iter().any(|id| *id >= 0);
+            let holds_spilled_lineage = fields.iter().any(|id| spilled_field_ids.contains(id));
+            holds_schema_field || (holds_user_field && !holds_spilled_lineage)
+        });
+        let get_lengths = user_data_files.clone().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
                 .open_reader(data_file, None, &FragReadConfig::default())
@@ -1814,7 +1867,7 @@ impl FileFragment {
 
         let get_lengths = get_lengths?;
         let expected_length = get_lengths.first().unwrap_or(&0);
-        for (length, data_file) in get_lengths.iter().zip(self.metadata.files.iter()) {
+        for (length, data_file) in get_lengths.iter().zip(user_data_files) {
             if length != expected_length {
                 let path = self
                     .dataset
@@ -2261,7 +2314,6 @@ impl FileFragment {
         stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-        max_field_id: i32,
     ) -> Result<(Fragment, Schema)> {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
@@ -2296,7 +2348,8 @@ impl FileFragment {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(max_field_id));
+        // Use the same starting id as the updater so schema and data file ids match.
+        new_schema.set_field_id(Some(self.dataset.manifest.max_field_id()));
 
         let new_fragment = self
             .clone()
@@ -3447,17 +3500,15 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+    /// Emit the `_row_last_updated_at_version` column, served from `sequence`;
+    /// `None` means the fragment has no version metadata and every row reads
+    /// as version 1.
+    pub(crate) fn with_row_last_updated_at_version(
+        &mut self,
+        sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_last_updated_at_version = true;
-
-        // Load the version sequence if not already loaded
-        if self.last_updated_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.last_updated_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.last_updated_at_sequence = Some(Arc::new(sequence));
-        }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        self.last_updated_at_sequence = sequence;
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -3468,17 +3519,15 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
+    /// Emit the `_row_created_at_version` column, served from `sequence`;
+    /// `None` means the fragment has no version metadata and every row reads
+    /// as version 1.
+    pub(crate) fn with_row_created_at_version(
+        &mut self,
+        sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_created_at_version = true;
-
-        // Load the version sequence if not already loaded
-        if self.created_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.created_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.created_at_sequence = Some(Arc::new(sequence));
-        }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        self.created_at_sequence = sequence;
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -6927,6 +6976,66 @@ mod tests {
             row_id += 1;
             i += 1;
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_columns_field_ids_match_data_file() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        // The dropped column's id stays in the data files, so the manifest's
+        // max field id is larger than the schema's.
+        dataset.drop_columns(&["s"]).await.unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("double_i", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter_values((0..400).step_by(2))),
+            ],
+        )
+        .unwrap();
+        let fragments = dataset.get_fragments();
+        let mut merged_fragments = Vec::with_capacity(fragments.len());
+        let mut merged_schema = dataset.schema().clone();
+        for mut frag in fragments {
+            let stream = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+            let (new_frag, new_schema) = frag.merge_columns(stream, "i", "i").await.unwrap();
+            let new_field_id = new_schema.field("double_i").unwrap().id;
+            assert_eq!(new_field_id, dataset.manifest.max_field_id() + 1);
+            assert_eq!(
+                new_frag.files.last().unwrap().fields.as_ref(),
+                &[new_field_id]
+            );
+            merged_fragments.push(new_frag);
+            merged_schema = new_schema;
+        }
+
+        let dataset = Dataset::commit(
+            &test_dir,
+            Operation::Merge {
+                fragments: merged_fragments,
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let actual = dataset
+            .scan()
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, batch);
     }
 
     #[tokio::test]

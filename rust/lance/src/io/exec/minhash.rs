@@ -209,6 +209,7 @@ impl ExecutionPlan for MinHashSearchExec {
         let prefilter_source = self.prefilter_source.clone();
         let overlay_block = self.overlay_block.clone();
         let external_mask = self.external_mask.clone();
+        let metrics = self.metrics.clone();
         let index_metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream = stream::once(async move {
@@ -242,6 +243,7 @@ impl ExecutionPlan for MinHashSearchExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics,
             )?;
             pre_filter.wait_for_ready().await?;
             let mask = pre_filter.mask();

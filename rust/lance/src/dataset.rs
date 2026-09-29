@@ -105,9 +105,9 @@ mod take;
 pub mod transaction {
     pub use lance_table::transaction::{
         DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
-        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
-        validate_operation,
+        RewrittenIndex, TaggedRewriteAssembly, Transaction, TransactionBuilder, UpdateMap,
+        UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
+        translate_schema_metadata_updates, validate_operation,
     };
 }
 pub mod udtf;
@@ -3325,6 +3325,12 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+            &src_ds.object_store,
+            &src_ds.manifest_location,
+            &src_ds.manifest,
+        )
+        .await?;
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -3416,7 +3422,8 @@ impl Dataset {
             .with_object_store(target_store.clone())
             .with_source_store(src_ds.object_store.clone())
             .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .with_deep_clone_files_copied();
         let new_ds = builder.execute(txn).await?;
         Ok(new_ds)
     }
@@ -4149,6 +4156,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            spilled_row_lineage: Default::default(),
         }
     }
 }
@@ -4192,6 +4200,9 @@ pub(crate) async fn write_manifest_file(
     may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
+    if let Some(indices) = &indices {
+        lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
+    }
     // Every manifest write funnels through here, including restore and clone,
     // which rebuild a manifest from a stored one rather than from an Arrow
     // schema. Validate names and primary keys at this boundary so all write
