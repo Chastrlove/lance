@@ -210,7 +210,7 @@ async fn write_partition_spanning_many_batches(store: &dyn IndexStore) {
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for i in 0..MANY_BATCH_TOKENS {
         // Zero-padded so tokens are inserted in sorted order, as the set expects.
-        builder.tokens.add(format!("tok{i:05}"));
+        builder.tokens.get_or_add(&format!("tok{i:05}"));
         let doc_id = builder.docs.append(MANY_BATCH_ROW_ID_BASE + i, 1);
         let mut posting_list = PostingListBuilder::new(false);
         posting_list.add(doc_id, PositionRecorder::Count(1));
@@ -287,15 +287,15 @@ async fn test_and_query_skips_partition_missing_required_term() {
     ));
 
     let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder0.tokens.add("alpha".to_owned());
+    builder0.tokens.get_or_add("alpha");
     builder0.posting_lists.push(PostingListBuilder::new(false));
     builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder0.docs.append(100, 1);
     builder0.write(store.as_ref()).await.unwrap();
 
     let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
-    builder1.tokens.add("alpha".to_owned());
-    builder1.tokens.add("beta".to_owned());
+    builder1.tokens.get_or_add("alpha");
+    builder1.tokens.get_or_add("beta");
     builder1.posting_lists.push(PostingListBuilder::new(false));
     builder1.posting_lists.push(PostingListBuilder::new(false));
     builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -343,9 +343,9 @@ async fn test_fuzzy_and_groups_expansions_by_original_position() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("alphi".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("alphi");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
@@ -440,7 +440,7 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token in ["alpha", "alphi", "beta", "beti"] {
-        builder.tokens.add(token.to_owned());
+        builder.tokens.get_or_add(token);
         builder.posting_lists.push(PostingListBuilder::new(false));
     }
     for token_id in 0..4 {
@@ -486,7 +486,7 @@ async fn write_variant_partition(
 ) {
     let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
     for token in variants {
-        builder.tokens.add((*token).to_owned());
+        builder.tokens.get_or_add(token);
         builder.posting_lists.push(PostingListBuilder::new(false));
     }
     for (local_idx, row_id) in row_ids.iter().enumerate() {
@@ -529,7 +529,7 @@ async fn write_pair_partition_with_position(
         }
     }
     for (token, posting) in postings {
-        builder.tokens.add(token);
+        builder.tokens.get_or_add(&token);
         builder.posting_lists.push(posting);
     }
     builder.write(store.as_ref()).await.unwrap();
@@ -1487,9 +1487,9 @@ async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("alphi".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("alphi");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
@@ -1556,8 +1556,8 @@ async fn test_grouped_scoring_keeps_exact_winner_outside_proxy_window(#[case] op
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("common".to_owned());
-    builder.tokens.add("rare".to_owned());
+    builder.tokens.get_or_add("common");
+    builder.tokens.get_or_add("rare");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     for doc_id in 0..3 {
@@ -1610,9 +1610,9 @@ async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
 
     let num_docs = BLOCK_SIZE * 2 + 4;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("alphi".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("alphi");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
@@ -1684,8 +1684,8 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
         TokenSetFormat::default(),
         InvertedListFormatVersion::V1,
     );
-    builder.tokens.add("hello".to_owned());
-    builder.tokens.add("world".to_owned());
+    builder.tokens.get_or_add("hello");
+    builder.tokens.get_or_add("world");
     builder
         .posting_lists
         .push(PostingListBuilder::new_with_posting_tail_codec(
