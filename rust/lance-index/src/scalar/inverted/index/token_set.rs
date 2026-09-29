@@ -252,6 +252,84 @@ impl TokenSet {
         }
     }
 
+    /// [`Self::get`] for many `(dictionary, token)` pairs, returning results
+    /// in input order.
+    ///
+    /// An FST walk is a chain of dependent reads, and the dictionaries of a
+    /// many-partition index far exceed the CPU caches, so resolving one pair
+    /// at a time waits on one cache miss at a time. Advancing several
+    /// independent walks in rotation, and prefetching each walk's next node,
+    /// overlaps those misses.
+    pub(super) fn get_many(lookups: &[(&Self, &str)]) -> Vec<Option<u32>> {
+        const MAX_WALKS: usize = 16;
+
+        struct Walk<'a> {
+            lookup: usize,
+            fst: &'a fst::raw::Fst<Vec<u8>>,
+            key: &'a [u8],
+            depth: usize,
+            addr: fst::raw::CompiledAddr,
+            output: fst::raw::Output,
+        }
+
+        let mut results = vec![None; lookups.len()];
+        let mut walks = Vec::with_capacity(MAX_WALKS.min(lookups.len()));
+        let mut next_lookup = 0;
+        loop {
+            while walks.len() < MAX_WALKS && next_lookup < lookups.len() {
+                let (dictionary, token) = lookups[next_lookup];
+                match &dictionary.tokens {
+                    TokenMap::HashMap(map) => results[next_lookup] = map.get(token).copied(),
+                    TokenMap::Fst(map) => {
+                        let fst = map.as_fst();
+                        walks.push(Walk {
+                            lookup: next_lookup,
+                            fst,
+                            key: token.as_bytes(),
+                            depth: 0,
+                            addr: fst.root().addr(),
+                            output: fst::raw::Output::zero(),
+                        });
+                    }
+                }
+                next_lookup += 1;
+            }
+            if walks.is_empty() {
+                return results;
+            }
+
+            // Mirrors `fst::raw::Fst::get`, one node per walk per round.
+            let mut walk_index = 0;
+            while walk_index < walks.len() {
+                let walk = &mut walks[walk_index];
+                let node = walk.fst.node(walk.addr);
+                let finished = match walk.key.get(walk.depth) {
+                    None => Some(
+                        node.is_final()
+                            .then(|| walk.output.cat(node.final_output()).value() as u32),
+                    ),
+                    Some(&byte) => match node.find_input(byte) {
+                        None => Some(None),
+                        Some(transition_index) => {
+                            let transition = node.transition(transition_index);
+                            walk.output = walk.output.cat(transition.out);
+                            walk.addr = transition.addr;
+                            walk.depth += 1;
+                            prefetch_fst_node(walk.fst.as_bytes(), transition.addr);
+                            None
+                        }
+                    },
+                };
+                if let Some(token_id) = finished {
+                    results[walk.lookup] = token_id;
+                    walks.swap_remove(walk_index);
+                } else {
+                    walk_index += 1;
+                }
+            }
+        }
+    }
+
     // the `removed_token_ids` must be sorted
     pub fn remap(&mut self, removed_token_ids: &[u32]) {
         if removed_token_ids.is_empty() {
@@ -529,84 +607,6 @@ impl TokenDictionary {
                     })?;
                 }
                 fst_token_batch(builder.into_map(), self.len() as u32, self.bytes.len())
-            }
-        }
-    }
-
-    /// [`Self::get`] for many `(dictionary, token)` pairs, returning results
-    /// in input order.
-    ///
-    /// An FST walk is a chain of dependent reads, and the dictionaries of a
-    /// many-partition index far exceed the CPU caches, so resolving one pair
-    /// at a time waits on one cache miss at a time. Advancing several
-    /// independent walks in rotation, and prefetching each walk's next node,
-    /// overlaps those misses.
-    pub(super) fn get_many(lookups: &[(&Self, &str)]) -> Vec<Option<u32>> {
-        const MAX_WALKS: usize = 16;
-
-        struct Walk<'a> {
-            lookup: usize,
-            fst: &'a fst::raw::Fst<Vec<u8>>,
-            key: &'a [u8],
-            depth: usize,
-            addr: fst::raw::CompiledAddr,
-            output: fst::raw::Output,
-        }
-
-        let mut results = vec![None; lookups.len()];
-        let mut walks = Vec::with_capacity(MAX_WALKS.min(lookups.len()));
-        let mut next_lookup = 0;
-        loop {
-            while walks.len() < MAX_WALKS && next_lookup < lookups.len() {
-                let (dictionary, token) = lookups[next_lookup];
-                match &dictionary.tokens {
-                    TokenMap::HashMap(map) => results[next_lookup] = map.get(token).copied(),
-                    TokenMap::Fst(map) => {
-                        let fst = map.as_fst();
-                        walks.push(Walk {
-                            lookup: next_lookup,
-                            fst,
-                            key: token.as_bytes(),
-                            depth: 0,
-                            addr: fst.root().addr(),
-                            output: fst::raw::Output::zero(),
-                        });
-                    }
-                }
-                next_lookup += 1;
-            }
-            if walks.is_empty() {
-                return results;
-            }
-
-            // Mirrors `fst::raw::Fst::get`, one node per walk per round.
-            let mut walk_index = 0;
-            while walk_index < walks.len() {
-                let walk = &mut walks[walk_index];
-                let node = walk.fst.node(walk.addr);
-                let finished = match walk.key.get(walk.depth) {
-                    None => Some(
-                        node.is_final()
-                            .then(|| walk.output.cat(node.final_output()).value() as u32),
-                    ),
-                    Some(&byte) => match node.find_input(byte) {
-                        None => Some(None),
-                        Some(transition_index) => {
-                            let transition = node.transition(transition_index);
-                            walk.output = walk.output.cat(transition.out);
-                            walk.addr = transition.addr;
-                            walk.depth += 1;
-                            prefetch_fst_node(walk.fst.as_bytes(), transition.addr);
-                            None
-                        }
-                    },
-                };
-                if let Some(token_id) = finished {
-                    results[walk.lookup] = token_id;
-                    walks.swap_remove(walk_index);
-                } else {
-                    walk_index += 1;
-                }
             }
         }
     }
