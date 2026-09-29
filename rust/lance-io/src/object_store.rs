@@ -996,14 +996,12 @@ impl ObjectStore {
             "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
-                if let Some(parent) = local_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
                 let parent = local_path
                     .parent()
                     .expect("file path must have parent")
                     .to_owned();
                 let named_temp = tokio::task::spawn_blocking(move || {
+                    super::local::create_dir_all_durable(&parent)?;
                     #[cfg(unix)]
                     {
                         // NamedTempFile defaults to 0o600. Use ordinary file creation permissions so the published file honors the caller's umask.

@@ -109,7 +109,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         #[cfg(windows)]
         let (inner, local_dir_operations) = match windows::extract_unc_path(&base_path)? {
             Some(unc_path) => {
-                let inner = LocalFileSystem::new_with_prefix(unc_path.root)?;
+                let inner = LocalFileSystem::new_with_prefix(unc_path.root)?.with_fsync(true);
                 let operations = FileSystemDirOperations {
                     local_file_system: inner.clone(),
                 };
@@ -118,10 +118,10 @@ impl ObjectStoreProvider for FileStoreProvider {
                     Some(Arc::new(operations) as Arc<dyn LocalDirOperations>),
                 )
             }
-            None => (LocalFileSystem::new(), None),
+            None => (LocalFileSystem::new().with_fsync(true), None),
         };
         #[cfg(not(windows))]
-        let inner = LocalFileSystem::new();
+        let inner = LocalFileSystem::new().with_fsync(true);
         #[cfg(not(windows))]
         let local_dir_operations = None;
 

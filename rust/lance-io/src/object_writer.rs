@@ -693,6 +693,7 @@ impl LocalWriter {
     }
 
     async fn persist(
+        file: tokio::fs::File,
         temp_path: tempfile::TempPath,
         final_path: Path,
         size: usize,
@@ -700,22 +701,48 @@ impl LocalWriter {
         metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
-        let persisted = tokio::task::spawn_blocking(move || -> Result<String> {
-            temp_path.persist(&local_path).map_err(|e| {
+        let persisted = async {
+            file.sync_all().await.map_err(|e| {
                 Error::io(format!(
-                    "failed to persist temp file to {}: {}",
-                    local_path, e.error
+                    "failed to sync temp file for {}: {}",
+                    final_path, e
                 ))
             })?;
+            // The open handle must be closed before replacing the destination on Windows.
+            drop(file);
 
-            let metadata = std::fs::metadata(&local_path).map_err(|e| {
-                Error::io(format!("failed to read metadata for {}: {}", local_path, e))
-            })?;
-            Ok(get_etag(&metadata))
-        })
-        .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
-        .and_then(|e_tag| e_tag);
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                temp_path.persist(&local_path).map_err(|e| {
+                    Error::io(format!(
+                        "failed to persist temp file to {}: {}",
+                        local_path, e.error
+                    ))
+                })?;
+
+                #[cfg(unix)]
+                {
+                    let parent = std::path::Path::new(&local_path).parent().ok_or_else(|| {
+                        Error::io(format!("file {} has no parent directory", local_path))
+                    })?;
+                    std::fs::File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|e| {
+                            Error::io(format!(
+                                "failed to sync parent directory of {}: {}",
+                                local_path, e
+                            ))
+                        })?;
+                }
+
+                let metadata = std::fs::metadata(&local_path).map_err(|e| {
+                    Error::io(format!("failed to read metadata for {}: {}", local_path, e))
+                })?;
+                Ok(get_etag(&metadata))
+            })
+            .await
+            .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))?
+        }
+        .await;
 
         metrics.record(&persisted, size as u64);
         let e_tag = persisted?;
@@ -779,6 +806,7 @@ impl AsyncWrite for LocalWriter {
                     mut_self.state = LocalWriteState::Finishing {
                         size,
                         future: Box::pin(Self::persist(
+                            state.writer.into_inner(),
                             state.temp_path,
                             mut_self.path.clone(),
                             size,
@@ -790,6 +818,7 @@ impl AsyncWrite for LocalWriter {
                 LocalWriteState::Finishing { future, .. } => match future.poll_unpin(cx) {
                     Poll::Ready(Ok(result)) => mut_self.state = LocalWriteState::Done(result),
                     Poll::Ready(Err(e)) => {
+                        mut_self.state = LocalWriteState::Poisoned;
                         return Poll::Ready(Err(io::Error::other(e)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -1484,6 +1513,35 @@ mod tests {
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_local_writer_sync_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("unsynced.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (temp_file, temp_path) = named_temp.into_parts();
+        drop(temp_file);
+
+        let unsyncable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut writer = LocalWriter::new(
+            tokio::fs::File::from_std(unsyncable),
+            os_path,
+            temp_path,
+            Arc::new(IOTracker::default()),
+        );
+        writer.write_all(b"data").await.unwrap();
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("failed to sync temp file"));
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
     }
 
     #[tokio::test]
