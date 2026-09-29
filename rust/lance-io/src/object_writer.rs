@@ -792,8 +792,13 @@ impl AsyncWrite for LocalWriter {
         loop {
             match &mut mut_self.state {
                 LocalWriteState::Writing(state) => {
-                    if Pin::new(&mut state.writer).poll_shutdown(cx).is_pending() {
-                        return Poll::Pending;
+                    match Pin::new(&mut state.writer).poll_shutdown(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(err)) => {
+                            mut_self.state = LocalWriteState::Poisoned;
+                            return Poll::Ready(Err(err));
+                        }
+                        Poll::Ready(Ok(())) => {}
                     }
 
                     // Write is complete, we can transition to persisting.
@@ -1513,6 +1518,33 @@ mod tests {
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_flush_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("flush_failed.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (temp_file, temp_path) = named_temp.into_parts();
+        drop(temp_file);
+
+        let read_only = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&temp_file_path)
+            .unwrap();
+        let mut writer = LocalWriter::new(
+            tokio::fs::File::from_std(read_only),
+            os_path,
+            temp_path,
+            Arc::new(IOTracker::default()),
+        );
+        writer.write_all(b"data").await.unwrap();
+
+        assert!(Writer::shutdown(&mut writer).await.is_err());
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
     }
 
     #[cfg(target_os = "linux")]

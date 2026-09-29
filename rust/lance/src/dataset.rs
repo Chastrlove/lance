@@ -754,7 +754,15 @@ impl Dataset {
             _ => e,
         })?;
 
-        let manifest_size = object_reader.size().await?;
+        let manifest_size = object_reader.size().await.map_err(|err| match err {
+            object_store::Error::NotFound { path, source } => {
+                Error::dataset_not_found(path, source)
+            }
+            _ => Error::io(format!(
+                "failed to read manifest {}: {}",
+                manifest_location.path, err
+            )),
+        })?;
         if manifest_size < 16 {
             if manifest_location.size.is_some() {
                 let manifest_location = ManifestLocation {
