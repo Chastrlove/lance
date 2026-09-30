@@ -636,6 +636,7 @@ impl Writer for ObjectWriter {
 pub struct LocalWriter {
     path: Path,
     state: LocalWriteState,
+    fsync: bool,
 }
 
 #[derive(Default)]
@@ -671,6 +672,7 @@ impl LocalWriter {
     ) -> Self {
         Self {
             path,
+            fsync: false,
             state: LocalWriteState::Writing(Box::new(WritingState {
                 writer: tokio::io::BufWriter::new(file),
                 cursor: 0,
@@ -679,6 +681,11 @@ impl LocalWriter {
                 io_tracker,
             })),
         }
+    }
+
+    pub(crate) fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     fn already_closed_err(path: &Path) -> io::Error {
@@ -697,17 +704,20 @@ impl LocalWriter {
         temp_path: tempfile::TempPath,
         final_path: Path,
         size: usize,
+        fsync: bool,
         io_tracker: Arc<IOTracker>,
         metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
         let persisted = async {
-            file.sync_all().await.map_err(|e| {
-                Error::io(format!(
-                    "failed to sync temp file for {}: {}",
-                    final_path, e
-                ))
-            })?;
+            if fsync {
+                file.sync_all().await.map_err(|e| {
+                    Error::io(format!(
+                        "failed to sync temp file for {}: {}",
+                        final_path, e
+                    ))
+                })?;
+            }
             // The open handle must be closed before replacing the destination on Windows.
             drop(file);
 
@@ -720,7 +730,7 @@ impl LocalWriter {
                 })?;
 
                 #[cfg(unix)]
-                {
+                if fsync {
                     let parent = std::path::Path::new(&local_path).parent().ok_or_else(|| {
                         Error::io(format!("file {} has no parent directory", local_path))
                     })?;
@@ -815,6 +825,7 @@ impl AsyncWrite for LocalWriter {
                             state.temp_path,
                             mut_self.path.clone(),
                             size,
+                            mut_self.fsync,
                             state.io_tracker,
                             state.metrics,
                         )),
@@ -1567,7 +1578,8 @@ mod tests {
             os_path,
             temp_path,
             Arc::new(IOTracker::default()),
-        );
+        )
+        .with_fsync(true);
         writer.write_all(b"data").await.unwrap();
 
         let error = Writer::shutdown(&mut writer).await.unwrap_err();
