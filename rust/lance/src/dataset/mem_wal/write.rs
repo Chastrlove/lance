@@ -66,22 +66,6 @@ use super::manifest::ShardManifestStore;
 // Configuration
 // ============================================================================
 
-#[cfg(test)]
-#[derive(Default)]
-struct WriterTestHooks {
-    pause_next_index_apply: std::sync::atomic::AtomicBool,
-    index_apply_release: tokio::sync::Notify,
-    memtable_index_wait_started: tokio::sync::Notify,
-    memtable_index_wait_finished: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for WriterTestHooks {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriterTestHooks").finish_non_exhaustive()
-    }
-}
-
 /// Configuration for a shard writer.
 #[derive(Debug, Clone)]
 pub struct ShardWriterConfig {
@@ -272,9 +256,6 @@ pub struct ShardWriterConfig {
     /// [`Error::Backpressure`].
     /// Default: `None` (use the built-in valve).
     pub backpressure: Option<Arc<dyn BackpressureController>>,
-
-    #[cfg(test)]
-    test_hooks: Option<Arc<WriterTestHooks>>,
 }
 
 impl Default for ShardWriterConfig {
@@ -302,8 +283,6 @@ impl Default for ShardWriterConfig {
             store_params: None,
             session: None,
             backpressure: None,
-            #[cfg(test)]
-            test_hooks: None,
         }
     }
 }
@@ -2674,8 +2653,6 @@ impl ShardWriter {
             stats.clone(),
             config.observer.clone(),
             config.frozen_memtable_grace,
-            #[cfg(test)]
-            config.test_hooks.clone(),
         );
         task_executor.add_handler(
             "memtable_flusher".to_string(),
@@ -2710,8 +2687,6 @@ impl ShardWriter {
             cursors: Arc::clone(wal_flusher.cursors()),
             wal_flusher: wal_flusher.clone(),
             stats,
-            #[cfg(test)]
-            test_hooks: config.test_hooks.clone(),
         };
         task_executor.add_handler(
             "index_applier".to_string(),
@@ -3940,20 +3915,11 @@ struct IndexApplyHandler {
     cursors: Arc<WriterCursors>,
     wal_flusher: Arc<WalFlusher>,
     stats: SharedWriteStats,
-    #[cfg(test)]
-    test_hooks: Option<Arc<WriterTestHooks>>,
 }
 
 #[async_trait]
 impl MessageHandler<TriggerIndexApply> for IndexApplyHandler {
     async fn handle(&mut self, message: TriggerIndexApply) -> Result<()> {
-        #[cfg(test)]
-        if let Some(hooks) = &self.test_hooks
-            && hooks.pause_next_index_apply.swap(false, Ordering::AcqRel)
-        {
-            hooks.index_apply_release.notified().await;
-        }
-
         match apply_index_range(&self.cursors, message).await {
             Ok(applied) => {
                 // A coalesced no-op indexes nothing (`rows_indexed == 0`);
@@ -4236,8 +4202,6 @@ struct MemTableFlushHandler {
     /// before [`sweep_expired_frozen`] evicts it. See
     /// `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
-    #[cfg(test)]
-    test_hooks: Option<Arc<WriterTestHooks>>,
 }
 
 impl MemTableFlushHandler {
@@ -4252,7 +4216,6 @@ impl MemTableFlushHandler {
         stats: SharedWriteStats,
         observer: Option<Arc<dyn WalObserver>>,
         grace: Duration,
-        #[cfg(test)] test_hooks: Option<Arc<WriterTestHooks>>,
     ) -> Self {
         Self {
             state,
@@ -4264,8 +4227,6 @@ impl MemTableFlushHandler {
             stats,
             observer,
             grace,
-            #[cfg(test)]
-            test_hooks,
         }
     }
 }
@@ -4374,20 +4335,10 @@ impl MemTableFlushHandler {
             // than blocking on a cursor that will never arrive.
             if let Some(indexes) = memtable.indexes_arc() {
                 let target_indexed = memtable.batch_count();
-                #[cfg(test)]
-                if let Some(hooks) = &self.test_hooks {
-                    hooks.memtable_index_wait_started.notify_one();
-                }
-                let wait_result = self
-                    .wal_flusher
+                self.wal_flusher
                     .track_batch(Some(indexes), target_indexed, 0)
                     .wait()
-                    .await;
-                #[cfg(test)]
-                if let Some(hooks) = &self.test_hooks {
-                    hooks.memtable_index_wait_finished.notify_one();
-                }
-                wait_result?;
+                    .await?;
             }
 
             // Step 2: Flush the memtable to Lance storage. The covered WAL
@@ -4779,7 +4730,10 @@ mod tests {
     use lance_core::FenceReason;
     use lance_core::datatypes::LANCE_FIELD_ID_KEY;
     use rstest::rstest;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Wake, Waker};
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
@@ -5661,139 +5615,248 @@ mod tests {
         }
     }
 
-    /// A PK-only flush must wait for the asynchronous index apply before it
-    /// publishes the SSTable. Otherwise the manifest can name a generation
-    /// whose mandatory PK sidecar has not been written yet.
-    #[tokio::test]
-    async fn test_pk_only_flush_waits_for_index_apply() {
-        let (store, base_path, base_uri, _temp) = create_local_store().await;
+    /// Prepare a real frozen memtable with its WAL appended but its PK index
+    /// unapplied. The tests drive the handlers themselves, so no background
+    /// dispatcher can apply the index before the flush reaches its barrier.
+    #[cfg_attr(coverage, coverage(off))]
+    async fn pending_pk_flush() -> (ShardWriter, MemTableFlushHandler, Arc<MemTable>, TempDir) {
+        let (store, base_path, base_uri, temp) = create_local_store().await;
         let schema = create_pk_test_schema();
-        let shard_id = Uuid::new_v4();
-        let hooks = Arc::new(WriterTestHooks {
-            pause_next_index_apply: std::sync::atomic::AtomicBool::new(true),
-            ..Default::default()
-        });
-        let config = ShardWriterConfig {
-            shard_id,
-            durable_write: true,
-            max_wal_flush_interval: Some(Duration::from_secs(60)),
-            max_memtable_batches: 1,
-            test_hooks: Some(hooks.clone()),
-            ..Default::default()
-        };
-        let writer = ShardWriter::open(
-            store,
-            base_path,
+        let mut writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
             base_uri.clone(),
-            config,
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                max_wal_flush_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
             schema.clone(),
             vec![],
         )
         .await
         .unwrap();
+        writer.task_executor.shutdown_all().await.unwrap();
 
-        let (_, mut watcher) = writer
-            .put_no_wait(vec![create_test_batch(&schema, 1, 2)])
-            .await
-            .unwrap();
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            hooks.memtable_index_wait_started.notified(),
+        let WriterMode::MemTable {
+            state,
+            writer_state,
+            ..
+        } = &mut writer.mode
+        else {
+            unreachable!("the test enables memtables");
+        };
+        let writer_state = Arc::get_mut(writer_state).unwrap();
+        let (index_tx, _index_rx) = mpsc::unbounded_channel();
+        let (flush_tx, mut flush_rx) = mpsc::unbounded_channel();
+        writer_state.index_apply_tx = index_tx;
+        writer_state.memtable_flush_tx = flush_tx;
+        let mut state_guard = state.write().await;
+        let batch = conform_live_batch(
+            create_test_batch(&schema, 1, 2),
+            state_guard.memtable.schema(),
+            &writer_state.pk_columns,
         )
-        .await
-        .expect("PK-only flush did not wait for the pending index apply");
-        let manifest = writer.manifest().await.unwrap().unwrap();
-        assert!(
-            manifest.sstables.is_empty(),
-            "the SSTable must not be published before its PK index is ready"
-        );
-
-        hooks.index_apply_release.notify_one();
-        watcher
-            .as_mut()
-            .expect("durable put returns a watcher")
-            .wait()
+        .unwrap();
+        state_guard.memtable.insert_batch_only(batch).await.unwrap();
+        let batch_store = state_guard.memtable.batch_store();
+        let wal_result = writer
+            .wal_flusher
+            .flush(
+                &WalFlushSource::BatchStore {
+                    batch_store: batch_store.clone(),
+                },
+                batch_store.len(),
+            )
             .await
             .unwrap();
-        writer.wait_for_flush_drain().await.unwrap();
+        let wal_position = wal_result.entry.unwrap().position;
+        state_guard.last_flushed_wal_entry_position = wal_position;
+        writer_state.freeze_memtable(&mut state_guard).unwrap();
+        drop(state_guard);
+        let TriggerMemTableFlush::Flush { memtable, .. } = flush_rx.try_recv().unwrap();
 
-        assert_eq!(
-            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
-            vec![1, 2],
-            "the published PK-only SSTable must be readable through the LSM scanner"
+        let handler = MemTableFlushHandler::new(
+            state.clone(),
+            writer_state.memory.clone(),
+            Arc::new(MemTableFlusher::new(
+                store,
+                base_path,
+                base_uri,
+                writer.config.shard_id,
+                writer.manifest_store.clone(),
+            )),
+            writer.wal_flusher.clone(),
+            writer.epoch,
+            vec![],
+            writer.stats.clone(),
+            None,
+            Duration::ZERO,
         );
-
-        writer.close().await.unwrap();
+        (writer, handler, memtable, temp)
     }
 
-    /// Abort must wake a flush that is waiting for index work before cancelling
-    /// the dispatcher that owns that work. Otherwise cancellation can discard
-    /// the apply and leave shutdown joining the flush forever.
-    #[tokio::test]
-    async fn test_abort_wakes_flush_waiting_for_index_apply() {
-        let (store, base_path, base_uri, _temp) = create_local_store().await;
-        let schema = create_pk_test_schema();
-        let hooks = Arc::new(WriterTestHooks {
-            pause_next_index_apply: std::sync::atomic::AtomicBool::new(true),
-            ..Default::default()
+    /// Poll into the cursor wait and prove that its notification wakes this
+    /// future. Ignore wakes from blocking I/O threads so an unrelated pending
+    /// storage operation cannot satisfy the assertion.
+    #[cfg_attr(coverage, coverage(off))]
+    fn assert_waiting_for_cursor(future: Pin<&mut impl Future>, cursors: &WriterCursors) {
+        struct CursorWake {
+            thread: std::thread::ThreadId,
+            wakes: AtomicUsize,
+        }
+
+        impl Wake for CursorWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                if std::thread::current().id() == self.thread {
+                    self.wakes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let counter = Arc::new(CursorWake {
+            thread: std::thread::current().id(),
+            wakes: AtomicUsize::new(0),
         });
-        let config = ShardWriterConfig {
-            shard_id: Uuid::new_v4(),
-            durable_write: false,
-            max_wal_flush_interval: Some(Duration::from_secs(60)),
-            max_memtable_batches: 1,
-            test_hooks: Some(hooks.clone()),
-            ..Default::default()
-        };
-        let writer = Arc::new(
-            ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
-                .await
-                .unwrap(),
-        );
-
-        let (_, _watcher) = writer
-            .put_no_wait(vec![create_test_batch(&schema, 1, 2)])
-            .await
-            .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            hooks.memtable_index_wait_started.notified(),
-        )
-        .await
-        .expect("PK-only flush did not wait for the held index apply");
-
-        let abort_writer = writer.clone();
-        let abort_task = tokio::spawn(async move { abort_writer.abort().await });
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            hooks.memtable_index_wait_finished.notified(),
-        )
-        .await
-        .expect("abort did not wake the flush cursor waiter");
+        let waker = Waker::from(counter.clone());
+        assert!(future.poll(&mut Context::from_waker(&waker)).is_pending());
+        counter.wakes.store(0, Ordering::Relaxed);
+        cursors.wake();
         assert!(
-            !abort_task.is_finished(),
-            "abort must still join an index handler that is already in flight"
+            counter.wakes.load(Ordering::Relaxed) > 0,
+            "the flush must be waiting on the writer cursor before index application"
         );
+    }
 
-        hooks.index_apply_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), abort_task)
-            .await
-            .expect("abort hung after the in-flight index handler was released")
-            .unwrap()
-            .unwrap();
-
-        assert!(
-            writer.wal_flusher.check_poisoned().is_err(),
-            "abort must poison the cursors before cancelling background work"
-        );
+    /// A PK-only flush must wait for the asynchronous index apply before it
+    /// publishes the SSTable. Otherwise the manifest can name a generation
+    /// whose mandatory PK sidecar has not been written yet.
+    #[tokio::test]
+    async fn test_pk_only_flush_waits_for_index_apply() {
+        let (writer, mut handler, memtable, temp) = pending_pk_flush().await;
+        let indexes = memtable.indexes_arc().unwrap();
+        assert_eq!(indexes.indexed_count(), 0);
+        let mut flush = Box::pin(handler.flush_memtable(memtable.clone()));
+        assert_waiting_for_cursor(flush.as_mut(), writer.wal_flusher.cursors());
         assert!(
             writer
                 .manifest()
                 .await
                 .unwrap()
-                .is_none_or(|manifest| manifest.sstables.is_empty()),
-            "abort must not publish the waiting memtable"
+                .unwrap()
+                .sstables
+                .is_empty()
+        );
+
+        apply_index_range(
+            writer.wal_flusher.cursors(),
+            TriggerIndexApply {
+                batch_store: memtable.batch_store(),
+                indexes,
+                end_batch_position: memtable.batch_count(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), flush)
+            .await
+            .expect("flush did not finish after applying its PK index")
+            .unwrap();
+        let base_uri = format!("file://{}", temp.path().display());
+        assert_eq!(
+            read_sstable_ids_via_lsm(
+                &writer,
+                writer.logical_schema.clone(),
+                &base_uri,
+                writer.config.shard_id,
+                None,
+            )
+            .await,
+            vec![1, 2],
+            "the published PK-only SSTable must be readable through the LSM scanner"
+        );
+    }
+
+    /// Abort must wake an in-flight flush before cancellation discards the
+    /// queued index apply that would otherwise advance its cursor.
+    #[tokio::test]
+    async fn test_abort_wakes_flush_waiting_for_index_apply() {
+        let (mut writer, handler, memtable, _temp) = pending_pk_flush().await;
+        writer.task_executor = Arc::new(TaskExecutor::new());
+        let indexes = memtable.indexes_arc().unwrap();
+        let mut completion = memtable.create_memtable_flush_completion();
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+        flush_tx
+            .send(TriggerMemTableFlush::Flush {
+                memtable: memtable.clone(),
+                done: None,
+            })
+            .unwrap();
+        let mut dispatcher = Box::pin(
+            TaskDispatcher {
+                handler: Box::new(handler),
+                rx: flush_rx,
+                cancellation_token: writer.task_executor.cancellation_token.clone(),
+                name: "memtable_flusher".to_string(),
+            }
+            .run(),
+        );
+        assert_waiting_for_cursor(dispatcher.as_mut(), writer.wal_flusher.cursors());
+        writer
+            .task_executor
+            .tasks
+            .write()
+            .unwrap()
+            .push(("memtable_flusher".to_string(), tokio::spawn(dispatcher)));
+
+        let (index_tx, index_rx) = mpsc::unbounded_channel();
+        index_tx
+            .send(TriggerIndexApply {
+                batch_store: memtable.batch_store(),
+                indexes: indexes.clone(),
+                end_batch_position: memtable.batch_count(),
+            })
+            .unwrap();
+        writer
+            .task_executor
+            .add_handler(
+                "index_applier".to_string(),
+                Box::new(IndexApplyHandler {
+                    cursors: writer.wal_flusher.cursors().clone(),
+                    wal_flusher: writer.wal_flusher.clone(),
+                    stats: writer.stats.clone(),
+                }),
+                index_rx,
+            )
+            .unwrap();
+
+        // On this single-thread runtime neither spawned dispatcher can run
+        // before abort poisons the cursors and cancels their shared token.
+        tokio::time::timeout(Duration::from_secs(1), writer.abort())
+            .await
+            .expect("abort stranded the flush waiting for the cancelled index apply")
+            .unwrap();
+        assert_eq!(
+            indexes.indexed_count(),
+            0,
+            "abort must discard the queued apply"
+        );
+        let Some(DurabilityResult::Failed(message)) = completion.await_value().await else {
+            panic!("the pending flush must report abort's terminal failure");
+        };
+        assert!(message.contains("ShardWriter aborted"), "{message}");
+        assert!(
+            writer
+                .manifest()
+                .await
+                .unwrap()
+                .unwrap()
+                .sstables
+                .is_empty()
         );
     }
 
