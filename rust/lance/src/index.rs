@@ -12601,7 +12601,8 @@ mod tests {
             .scan()
             .nearest("vector", &Float32Array::from(query_vector), 10)
             .unwrap()
-            .nprobes(2)
+            .minimum_nprobes(2)
+            .maximum_nprobes(2)
             .try_into_batch()
             .await
             .unwrap();
