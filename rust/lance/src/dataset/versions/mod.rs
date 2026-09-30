@@ -144,6 +144,7 @@ pub async fn write_fragments(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -185,6 +186,7 @@ pub async fn write_fragments(
         target_bases_info,
         seed_writers,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await?;
     Ok((fragments, schema))
@@ -237,6 +239,7 @@ pub async fn write_fragments_direct(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>> {
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
         if file_row_counts.contains(&0) {
@@ -299,6 +302,7 @@ pub async fn write_fragments_direct(
         target_bases_info,
         seed_writers,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await
 }

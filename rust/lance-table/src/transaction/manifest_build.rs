@@ -26,8 +26,8 @@ use crate::io::{
 };
 use crate::rowids::version::build_version_meta;
 use crate::rowids::{read_row_ids, write_row_ids};
-use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
+use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -699,14 +699,9 @@ impl Transaction {
         let mut final_fragments = Vec::new();
         let mut final_indices = prepared_indices;
 
-        // A fragment-reuse index maps old row *addresses* to new ones, and the
-        // read path attaches it to every index it opens without checking
-        // whether the dataset uses stable row ids. Carrying it past the
-        // migration would therefore rewrite freshly issued row ids as if they
-        // were addresses, and rows whose new id happens to fall in the old
-        // address range would disappear from indexed queries. Nothing needs it
-        // afterwards either, since compaction rejects deferred index remap on
-        // a stable-row-id dataset.
+        // Release builds refuse to publish a stable-row-id dataset with a fragment
+        // reuse index, and nothing needs it: compaction rejects deferred index
+        // remap there.
         if config.migration_next_row_id.is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
@@ -822,6 +817,10 @@ impl Transaction {
                 for fragment in updated_fragments {
                     updated_by_id.entry(fragment.id).or_insert(fragment);
                 }
+                let live_field_ids = schema
+                    .fields_pre_order()
+                    .map(|field| field.id)
+                    .collect::<HashSet<_>>();
                 let updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
@@ -836,6 +835,15 @@ impl Transaction {
                             // fields it rewrote, since the fresh base values
                             // supersede them.
                             updated.overlays = f.overlays.clone();
+                            // A concurrent Project may have pruned files from the
+                            // current fragment after this post-image was staged.
+                            // Match Project's rule: retain a file if any field in
+                            // it remains live, including mixed live/dropped files.
+                            updated.files.retain(|file| {
+                                file.fields
+                                    .iter()
+                                    .any(|field_id| live_field_ids.contains(field_id))
+                            });
                             if matches!(update_mode, Some(RewriteColumns)) {
                                 crate::format::overlay::tombstone_overlay_fields(
                                     &mut updated.overlays,
@@ -923,6 +931,14 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+                // New fragments were staged against the same pre-Project schema.
+                for fragment in &mut new_fragments {
+                    fragment.files.retain(|file| {
+                        file.fields
+                            .iter()
+                            .any(|field_id| live_field_ids.contains(field_id))
+                    });
+                }
 
                 // Assign row IDs to any fragments that don't have them yet
                 // (e.g., inserted rows from merge_insert operations)
@@ -1054,6 +1070,11 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
+                        // Its bitmap is lineage, not coverage, and a straddling
+                        // group would fail the recalculation.
+                        if is_frag_reuse_index_entry(index) {
+                            continue;
+                        }
                         let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if results_are_row_addrs {
@@ -3148,11 +3169,70 @@ mod tests {
         assert_eq!(rows, vec![None, Some(42), None, Some(43)]);
     }
 
+    #[rstest::rstest]
+    #[case::unspecified(None)]
+    #[case::rewrite_rows(Some(UpdateMode::RewriteRows))]
+    #[case::rewrite_columns(Some(UpdateMode::RewriteColumns))]
+    fn test_update_build_manifest_does_not_restore_projected_files(
+        #[case] update_mode: Option<UpdateMode>,
+    ) {
+        let mut manifest = sample_manifest_with_fragments(0..3);
+        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
+        Arc::make_mut(&mut manifest.fragments)[1].files = vec![projected_file.clone()];
+
+        // Model an update staged before a projection removed field 1's file.
+        let mut updated = manifest.fragments[1].clone();
+        updated.files.push(DataFile::new_legacy_from_fields(
+            "dropped.lance",
+            vec![1],
+            None,
+        ));
+        updated.physical_rows = Some(42);
+        let inserted_projected_file =
+            DataFile::new_legacy_from_fields("inserted-projected.lance", vec![0], None);
+        let mut inserted = Fragment::new(0);
+        inserted.files = vec![
+            inserted_projected_file.clone(),
+            DataFile::new_legacy_from_fields("inserted-dropped.lance", vec![1], None),
+        ];
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated],
+                new_fragments: vec![inserted],
+                fields_modified: vec![1],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let fragment = &new_manifest.fragments[1];
+        assert_eq!(fragment.files, vec![projected_file]);
+        assert_eq!(fragment.physical_rows, Some(42));
+        assert_eq!(
+            new_manifest.fragments[3].files,
+            vec![inserted_projected_file]
+        );
+        assert_eq!(new_manifest.max_field_id(), 0);
+    }
+
     #[test]
     fn test_delete_build_manifest_applies_deletion_to_current_fragment() {
         let mut manifest = sample_manifest_with_fragments(0..5);
         manifest.version = 2;
+        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
         let current_fragment = &mut Arc::make_mut(&mut manifest.fragments)[2];
+        current_fragment.files = vec![projected_file.clone()];
         current_fragment.physical_rows = Some(42);
         current_fragment.overlays = vec![overlay_with_field(0, 2)];
         current_fragment.last_updated_at_version_meta = Some(
@@ -3162,8 +3242,13 @@ mod tests {
             .unwrap(),
         );
 
+        // Model a delete staged before a projection removed field 1's file.
         let mut updated2 = Fragment::new(2);
         updated2.physical_rows = Some(42);
+        updated2.files = vec![
+            projected_file.clone(),
+            DataFile::new_legacy_from_fields("dropped.lance", vec![1], None),
+        ];
         let deletion_file = DeletionFile {
             read_version: 1,
             id: 10,
@@ -3189,16 +3274,17 @@ mod tests {
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![0, 2, 4]);
-        let rows: Vec<Option<usize>> = new_manifest
+        let fragment2 = new_manifest
             .fragments
             .iter()
-            .map(|f| f.physical_rows)
-            .collect();
-        assert_eq!(rows, vec![None, Some(42), None]);
-        let overlays = &new_manifest.fragments[1].overlays;
-        assert_eq!(overlays.len(), 1);
-        assert_eq!(overlays[0].committed_version, 2);
-        assert_eq!(new_manifest.fragments[1].deletion_file, Some(deletion_file));
+            .find(|fragment| fragment.id == 2)
+            .unwrap();
+        assert_eq!(fragment2.files, vec![projected_file]);
+        assert_eq!(fragment2.deletion_file, Some(deletion_file));
+        assert_eq!(fragment2.overlays.len(), 1);
+        assert_eq!(fragment2.overlays[0].committed_version, 2);
+        assert_eq!(fragment2.physical_rows, Some(42));
+        assert_eq!(new_manifest.max_field_id(), 0);
         assert_eq!(last_updated_at_versions(&new_manifest, 2), vec![2; 42]);
     }
 
