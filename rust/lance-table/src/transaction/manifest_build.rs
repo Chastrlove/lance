@@ -837,12 +837,13 @@ impl Transaction {
                             updated.overlays = f.overlays.clone();
                             // A concurrent Project may have pruned files from the
                             // current fragment after this post-image was staged.
-                            // Match Project's rule: retain a file if any field in
-                            // it remains live, including mixed live/dropped files.
+                            // Spilled lineage fields are absent from the schema,
+                            // but their carriers must survive just as in Project.
+                            let spilled = updated.spilled_row_lineage_field_ids();
                             updated.files.retain(|file| {
-                                file.fields
-                                    .iter()
-                                    .any(|field_id| live_field_ids.contains(field_id))
+                                file.fields.iter().any(|field_id| {
+                                    live_field_ids.contains(field_id) || spilled.contains(field_id)
+                                })
                             });
                             if matches!(update_mode, Some(RewriteColumns)) {
                                 crate::format::overlay::tombstone_overlay_fields(
@@ -933,10 +934,11 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 // New fragments were staged against the same pre-Project schema.
                 for fragment in &mut new_fragments {
+                    let spilled = fragment.spilled_row_lineage_field_ids();
                     fragment.files.retain(|file| {
-                        file.fields
-                            .iter()
-                            .any(|field_id| live_field_ids.contains(field_id))
+                        file.fields.iter().any(|field_id| {
+                            live_field_ids.contains(field_id) || spilled.contains(field_id)
+                        })
                     });
                 }
 
@@ -1946,7 +1948,8 @@ mod tests {
     use crate::format::pb;
     use crate::format::{
         DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
-        RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
+        RowIdMeta,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
@@ -3175,26 +3178,94 @@ mod tests {
     #[case::rewrite_columns(Some(UpdateMode::RewriteColumns))]
     fn test_update_build_manifest_does_not_restore_projected_files(
         #[case] update_mode: Option<UpdateMode>,
+        #[values(false, true)] with_spilled_lineage: bool,
     ) {
         let mut manifest = sample_manifest_with_fragments(0..3);
-        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
+        if with_spilled_lineage {
+            manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
+            manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS;
+            manifest.next_row_id = 126;
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                let start = fragment.id * 42;
+                fragment.physical_rows = Some(42);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&RowIdSequence::from(start..start + 42)).into(),
+                ));
+            }
+        }
+        let projected_file = DataFile::new(
+            "projected.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         Arc::make_mut(&mut manifest.fragments)[1].files = vec![projected_file.clone()];
 
         // Model an update staged before a projection removed field 1's file.
         let mut updated = manifest.fragments[1].clone();
-        updated.files.push(DataFile::new_legacy_from_fields(
+        updated.files.push(DataFile::new(
             "dropped.lance",
             vec![1],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
             None,
         ));
         updated.physical_rows = Some(42);
-        let inserted_projected_file =
-            DataFile::new_legacy_from_fields("inserted-projected.lance", vec![0], None);
+        let inserted_projected_file = DataFile::new(
+            "inserted-projected.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         let mut inserted = Fragment::new(0);
+        inserted.physical_rows = Some(42);
         inserted.files = vec![
             inserted_projected_file.clone(),
-            DataFile::new_legacy_from_fields("inserted-dropped.lance", vec![1], None),
+            DataFile::new(
+                "inserted-dropped.lance",
+                vec![1],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
         ];
+
+        let mut expected_updated_files = vec![projected_file];
+        let mut expected_inserted_files = vec![inserted_projected_file];
+        if with_spilled_lineage {
+            // Separate carriers ensure each lineage kind is retained even when
+            // the file has no field from the live schema.
+            for (fragment, expected_files) in [
+                (&mut updated, &mut expected_updated_files),
+                (&mut inserted, &mut expected_inserted_files),
+            ] {
+                fragment.row_id_meta = Some(RowIdMeta::Column);
+                fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column);
+                fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
+                for field_id in [
+                    ROW_ID_FIELD_ID,
+                    ROW_CREATED_AT_VERSION_FIELD_ID,
+                    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+                ] {
+                    let file = DataFile::new(
+                        format!("lineage-{field_id}.lance"),
+                        vec![field_id],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    );
+                    fragment.files.push(file.clone());
+                    expected_files.push(file);
+                }
+            }
+        }
 
         let transaction = Transaction::new(
             manifest.version,
@@ -3217,12 +3288,9 @@ mod tests {
             .unwrap();
 
         let fragment = &new_manifest.fragments[1];
-        assert_eq!(fragment.files, vec![projected_file]);
+        assert_eq!(fragment.files, expected_updated_files);
         assert_eq!(fragment.physical_rows, Some(42));
-        assert_eq!(
-            new_manifest.fragments[3].files,
-            vec![inserted_projected_file]
-        );
+        assert_eq!(new_manifest.fragments[3].files, expected_inserted_files);
         assert_eq!(new_manifest.max_field_id(), 0);
     }
 

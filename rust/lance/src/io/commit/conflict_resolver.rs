@@ -4990,6 +4990,12 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                current_lineage: None,
+                current_live: None,
+                current_schema: None,
+                read_fragments: None,
+                read_schema: None,
+                reuse: Default::default(),
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
