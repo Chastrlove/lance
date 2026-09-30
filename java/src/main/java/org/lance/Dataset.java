@@ -18,6 +18,7 @@ import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
+import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexBuildProgress;
 import org.lance.index.IndexCriteria;
@@ -171,7 +172,8 @@ public class Dataset implements Closeable {
               params.getInitialBases(),
               params.getTargetBases(),
               params.getAllowExternalBlobOutsideBases(),
-              params.getBlobPackFileSizeThreshold());
+              params.getBlobPackFileSizeThreshold(),
+              params.getFileWriteOptions());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -220,7 +222,8 @@ public class Dataset implements Closeable {
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
+      Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions);
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -259,6 +262,7 @@ public class Dataset implements Closeable {
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
@@ -311,6 +315,7 @@ public class Dataset implements Closeable {
             params.getTargetBases(),
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
+            params.getFileWriteOptions(),
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
@@ -1929,6 +1934,33 @@ public class Dataset implements Closeable {
 
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
+  private static void checkReadBufferSize(long bufferSize) {
+    if (bufferSize < 0) {
+      throw new IllegalArgumentException("bufferSize must be non-negative");
+    }
+  }
+
+  static void setBlobReadBufferSize(List<BlobFile> blobs, long bufferSize) throws IOException {
+    try {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.setReadBufferSize(bufferSize);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          try {
+            blob.close();
+          } catch (IOException | RuntimeException closeError) {
+            e.addSuppressed(closeError);
+          }
+        }
+      }
+      throw e;
+    }
+  }
+
   /**
    * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
    * with Rust/Python.
@@ -1964,6 +1996,19 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Open {@link BlobFile} handles and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobs(List<Long> rowIds, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobs(rowIds, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
    * Open {@link BlobFile} handles for given row indices on a blob column.
    *
    * <pre>{@code
@@ -1990,6 +2035,19 @@ public class Dataset implements Closeable {
           column != null && !column.isEmpty(), "column cannot be null or empty");
       return nativeTakeBlobsByIndices(rowIndices, column);
     }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by row index and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByIndices(rowIndices, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
   }
 
   /**
@@ -2027,10 +2085,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @return a new Dataset of the branch
    */
   public Dataset createBranch(String branch, Ref ref) {
@@ -2040,10 +2100,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @param storageOptions the storage options to create branch with
    * @return a new Dataset of the branch
    */
@@ -2064,8 +2126,9 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
-   * specified (branch_name, version_number).
+   * Checkout using a unified {@link Ref} which can be a tag, the latest version on the default
+   * branch or a named branch, or a specified (branch_name, version_number). In reference contexts,
+   * {@code "main"} is an alias for the default branch.
    *
    * @param ref the checkout reference
    * @return a new Dataset instance checked out to the specified reference
@@ -2096,7 +2159,7 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag on main branch. This is left for compatibility. We should use {@link
+     * Create a new tag on the default branch. This is left for compatibility. We should use {@link
      * #create(String, Ref)} instead.
      *
      * @param tag the tag name
@@ -2111,7 +2174,8 @@ public class Dataset implements Closeable {
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void create(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "Tag name cannot be null");
@@ -2128,6 +2192,8 @@ public class Dataset implements Closeable {
      *
      * @param tag the name of the tag to create
      * @param versionNumber the version number (or commit reference) to associate with the tag
+     * @param targetBranch the branch to tag. In reference contexts, {@code "main"} is an alias for
+     *     the default branch.
      */
     @Deprecated
     public void create(String tag, long versionNumber, String targetBranch) {
@@ -2147,11 +2213,11 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version_number on main. This is left for compatibility. We should use
-     * {@link #update(String, Ref)} instead.
+     * Update a tag to a new version_number on the default branch. This is left for compatibility.
+     * We should use {@link #update(String, Ref)} instead.
      *
      * @param tag the tag name
-     * @param versionNumber the versionNumber on main.
+     * @param versionNumber the versionNumber on the default branch.
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
@@ -2162,7 +2228,8 @@ public class Dataset implements Closeable {
      * Update a tag to a new reference.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void update(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "tag cannot be null");
@@ -2214,7 +2281,8 @@ public class Dataset implements Closeable {
     /**
      * Delete a branch and its metadata.
      *
-     * @param branchName the branch to delete
+     * @param branchName the branch to delete. {@code "main"} is reserved for the default branch and
+     *     cannot be deleted as a named branch.
      */
     public void delete(String branchName) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {

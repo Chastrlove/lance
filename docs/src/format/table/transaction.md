@@ -200,6 +200,10 @@ This includes operations such as compaction, defragmentation, and re-ordering.
 Rewrite operations change row addresses, requiring index updates.
 New fragment IDs must be reserved via `ReserveFragments` before executing a `Rewrite` transaction.
 
+A rewrite that defers index remapping publishes its address mapping in the
+same commit by replacing the [Fragment Reuse Index](../index/system/frag_reuse.md)
+entry in the manifest's index section.
+
 <details>
 <summary>Rewrite protobuf message</summary>
 
@@ -330,6 +334,7 @@ The Restore operation reverts the table to a previous version. It's generally as
 other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
+- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
 
 ### ReserveFragments
 
@@ -427,6 +432,7 @@ An UpdateConfig operation only modifies table config and tends to be compatible 
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
+- Restore (only if the UpdateConfig updates schema or field metadata)
 - UpdateConfig (only if the two operations modify the same config)
 
 ### DataReplacement

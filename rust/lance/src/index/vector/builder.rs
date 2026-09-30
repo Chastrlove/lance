@@ -39,6 +39,8 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -107,14 +109,18 @@ const SPLIT_SAMPLE_RATE: usize = 256;
 /// Upper bound on the number of partitions one oversized partition is split into
 /// in a single optimize pass; anything still oversized waits for the next pass.
 const MAX_SPLIT_WAYS: usize = 1024;
-/// Decoded bytes of raw vectors a join holds at a time: rows are fetched and
-/// regrouped until a batch reaches this size, so the working set does not
-/// depend on how many vectors the rows hold. A single row larger than this is
-/// the one batch that cannot be split further.
-const JOIN_FETCH_BYTES: usize = 32 * 1024 * 1024;
-/// Single-row fetches in flight while a join reads a multivector column, whose
+/// Decoded bytes of raw vectors a split or join re-reads from the dataset at a
+/// time: rows are fetched and regrouped until a batch reaches this size, so
+/// the working set does not depend on how many rows the adjustment touches or
+/// how many vectors they hold. A single row larger than this is the one batch
+/// that cannot be split further.
+const RAW_VECTOR_FETCH_BYTES: usize = 32 * 1024 * 1024;
+/// Fetches of `RAW_VECTOR_FETCH_BYTES` in flight while re-reading a
+/// fixed-size vector column.
+const RAW_VECTOR_FETCHES_IN_FLIGHT: usize = 2;
+/// Single-row fetches in flight while re-reading a multivector column, whose
 /// row sizes are unknown until read.
-const JOIN_MULTIVECTOR_FETCHES_IN_FLIGHT: usize = 4;
+const MULTIVECTOR_FETCHES_IN_FLIGHT: usize = 4;
 /// Vectors a join routes and quantizes at a time before handing them to the
 /// shuffler, whatever the fetched rows expanded to.
 const JOIN_VECTORS_PER_BATCH: usize = 1024;
@@ -177,6 +183,63 @@ fn apply_centroid_splits(
         concatenated,
         original.value_length(),
     )?)
+}
+
+/// Remap one partition of an IVF_HNSW index.
+///
+/// Every quantizer storage `remap` keeps the surviving vectors in their
+/// original order, so when no row was deleted the graph is carried over by
+/// [`remap_graph_batch`] unchanged. The graph is read with all columns because
+/// search loads skip the distances the index file must keep.
+///
+/// A deleted row does not rebuild the graph. Edges between survivors are kept,
+/// and each node that lost a neighbor is reconnected by
+/// [`remap_graph_repair`]: a construction-time beam search over the surviving
+/// graph, then the same neighbor heuristic the builder uses. The graph is
+/// rebuilt only when that repair cannot be applied.
+async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
+    index: &IVFIndex<S, Q>,
+    partition_id: usize,
+    mapping: &RowAddrRemap,
+) -> Result<(Q::Storage, S)> {
+    let old_storage = index.load_partition_storage(partition_id, None).await?;
+    let storage = old_storage.remap(mapping)?;
+    let graph = index.read_sub_index_batch(partition_id, None, None).await?;
+
+    let mut new_ids = Vec::with_capacity(old_storage.len());
+    let mut num_kept = 0u32;
+    for row_id in old_storage.row_ids() {
+        if matches!(mapping.get(*row_id), Some(None)) {
+            new_ids.push(None);
+        } else {
+            new_ids.push(Some(num_kept));
+            num_kept += 1;
+        }
+    }
+    let num_deleted = old_storage.len() - num_kept as usize;
+    if num_kept as usize == storage.len() {
+        let repaired = if num_deleted == 0 {
+            remap_graph_batch(&graph, &new_ids)
+        } else {
+            remap_graph_repair(&graph, &new_ids, &storage)
+        };
+        match repaired {
+            Ok(graph) => return Ok((storage, S::load(graph)?)),
+            // An index written before graphs were bounded to their storage can
+            // hold fewer nodes than vectors; rebuilding gives it full coverage.
+            Err(e) => log::warn!(
+                "Rebuilding the HNSW graph of partition {partition_id} during remap: {e}"
+            ),
+        }
+    } else {
+        log::warn!(
+            "Rebuilding the HNSW graph of partition {partition_id} during remap: {num_kept} \
+             rows survive the remap but the remapped storage has {} rows",
+            storage.len()
+        );
+    }
+    let index = S::load(graph)?.remap(mapping, &storage)?;
+    Ok((storage, index))
 }
 
 /// An index segment an optimize pass reads existing rows from, paired with the rows
@@ -550,12 +613,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .as_any()
                     .downcast_ref::<IVFIndex<S, Q>>()
                     .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-                let part = ivf_index
-                    .load_partition(part_id, false, &NoOpMetricsCollector)
-                    .await?;
-
-                let storage = part.storage.remap(&mapping)?;
-                let index = part.index.remap(&mapping, &storage)?;
+                let (storage, index) = if S::name() == HNSW::name() {
+                    remap_hnsw_partition(ivf_index, part_id, &mapping).await?
+                } else {
+                    let part = ivf_index
+                        .load_partition(part_id, false, &NoOpMetricsCollector)
+                        .await?;
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    (storage, index)
+                };
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
                     partition_id: part_id,
                     built: Some((storage, index, 0.0)),
@@ -2135,9 +2202,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input("dataset not set before reshuffle"));
         };
-        let Some(quantizer) = self.quantizer.clone() else {
-            return Err(Error::invalid_input("quantizer not set before reshuffle"));
-        };
 
         // Collect all row IDs for affected partitions, dedup, sort.
         let mut all_row_ids = Vec::new();
@@ -2148,56 +2212,46 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         all_row_ids.sort();
         all_row_ids.dedup();
 
-        // Stream raw vectors in chunks
-        let projection = Arc::new(dataset.schema().project(&[self.column.as_str()])?);
-        let row_ids = dataset.filter_deleted_ids(&all_row_ids).await?;
-        let block_size = self.store.block_size();
-        let io_parallelism = self.store.io_parallelism();
-        let column = self.column.clone();
-
-        let dataset_clone = dataset.clone();
-        let projection_clone = projection.clone();
-        let raw_stream = stream::iter(
-            row_ids
-                .chunks(block_size)
-                .map(|c| c.to_vec())
-                .collect::<Vec<_>>(),
-        )
-        .map(move |chunk| {
-            let dataset = dataset_clone.clone();
-            let projection = projection_clone.clone();
-            let column = column.clone();
-            async move {
-                let batch = dataset
-                    .take_rows(&chunk, ProjectionRequest::Schema(projection))
-                    .await?;
-                let batch = batch
-                    .try_with_column(ROW_ID_FIELD.clone(), Arc::new(UInt64Array::from(chunk)))?;
-                // For multivector, flatten
-                Flatten::new(&column).transform(&batch)
-            }
-        })
-        .buffered(io_parallelism)
-        .boxed();
-
-        let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
-                new_centroids.clone(),
-                self.distance_type,
-                &self.column,
-                quantizer.into(),
-                None,
-            )?,
+        let (transformer, vector_field) = self.assign_transformer(new_centroids)?;
+        let transformer = Arc::new(transformer);
+        let (rows_per_fetch, prefetch) = raw_vector_fetch_shape(
+            is_multivector_column(dataset.schema(), &self.column)?,
+            new_centroids.value_length() as usize,
+            &vector_field,
+            self.store.block_size(),
         );
+        let fetched = Self::take_vectors_stream(
+            dataset,
+            &self.column,
+            &all_row_ids,
+            rows_per_fetch,
+            prefetch,
+        )
+        .await?;
 
+        // A split can touch most of the index, so the raw vectors are read in
+        // batches of `RAW_VECTOR_FETCH_BYTES`, and each batch is sliced across
+        // the transform workers instead of admitting one whole batch per
+        // worker. The rows held at once are then bounded by the fetch budget,
+        // not by the number of affected rows or CPUs.
+        let column = self.column.clone();
+        let num_workers = get_num_compute_intensive_cpus().max(1);
+        let slices = regroup_by_bytes(Box::pin(fetched), RAW_VECTOR_FETCH_BYTES)
+            .map(move |batch| -> Result<_> {
+                // For multivector, flatten
+                let batch = Flatten::new(&column).transform(&batch?)?;
+                Ok(stream::iter(
+                    slice_evenly(batch, num_workers).map(Ok::<_, Error>),
+                ))
+            })
+            .try_flatten();
         let mut transformed_stream = Box::pin(
-            raw_stream
-                .map(move |batch| {
-                    let ivf_transformer = transformer.clone();
-                    tokio::spawn(async move { ivf_transformer.transform(&batch?) })
+            slices
+                .map(move |slice| {
+                    let transformer = transformer.clone();
+                    async move { spawn_cpu(move || transformer.transform(&slice?)).await }
                 })
-                .buffered(get_num_compute_intensive_cpus())
-                .map(|x| x.unwrap())
+                .buffered(num_workers)
                 .peekable(),
         );
 
@@ -2453,12 +2507,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // Rows each survivor can still take below the split threshold once the
         // reindexed rows' entries are gone. Only a multivector row has entries
         // outside the joined partitions, so only then are the survivors read.
-        let column_type = dataset
-            .schema()
-            .field(&self.column)
-            .map(|field| field.data_type())
-            .ok_or_else(|| Error::invalid_input(format!("column {} not found", self.column)))?;
-        let multivector = matches!(column_type, DataType::List(_) | DataType::LargeList(_));
+        let multivector = is_multivector_column(dataset.schema(), &self.column)?;
         let mut room = vec![0usize; ivf.num_partitions()];
         for &partition in &kept_partitions {
             let mut load = partition_sizes[partition];
@@ -2588,18 +2637,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .shuffle(Box::new(RecordBatchStreamAdapter::new(schema, batches)))
                 .await
         };
-        // A fixed-size vector row has a known size, so a chunk is sized to the
-        // budget up front; a multivector row does not, so those are fetched one
-        // at a time and regrouped by measured size.
-        let (rows_per_fetch, prefetch) = if multivector {
-            (1, JOIN_MULTIVECTOR_FETCHES_IN_FLIGHT)
-        } else {
-            let row_bytes = ivf.dimension() * vector_field_element_width(&vector_field);
-            (
-                (JOIN_FETCH_BYTES / row_bytes.max(1)).clamp(1, self.store.block_size()),
-                2,
-            )
-        };
+        let (rows_per_fetch, prefetch) = raw_vector_fetch_shape(
+            multivector,
+            ivf.dimension(),
+            &vector_field,
+            self.store.block_size(),
+        );
         let route = async move {
             for (&part_idx, row_ids) in partitions.iter().zip(rows_per_partition) {
                 if row_ids.is_empty() {
@@ -2619,7 +2662,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     prefetch,
                 )
                 .await?;
-                let mut chunks = Box::pin(regroup_by_bytes(fetched, JOIN_FETCH_BYTES));
+                let mut chunks = Box::pin(regroup_by_bytes(fetched, RAW_VECTOR_FETCH_BYTES));
                 while let Some(chunk) = chunks.try_next().await? {
                     let (row_ids, vectors) = self.flatten_raw_vectors(&chunk)?;
                     for start in (0..row_ids.len()).step_by(JOIN_VECTORS_PER_BATCH) {
@@ -2979,6 +3022,48 @@ where
             }
         },
     )
+}
+
+/// Rows per fetch and fetches in flight for re-reading the raw vectors of a
+/// split or join. A fixed-size vector row has a known size, so a fetch is sized
+/// to `RAW_VECTOR_FETCH_BYTES` up front, capped at `max_rows_per_fetch`; a
+/// multivector row does not, so those are fetched one at a time and regrouped
+/// by measured size.
+fn raw_vector_fetch_shape(
+    multivector: bool,
+    dimension: usize,
+    vector_field: &Field,
+    max_rows_per_fetch: usize,
+) -> (usize, usize) {
+    if multivector {
+        return (1, MULTIVECTOR_FETCHES_IN_FLIGHT);
+    }
+    let row_bytes = dimension * vector_field_element_width(vector_field);
+    (
+        (RAW_VECTOR_FETCH_BYTES / row_bytes.max(1)).clamp(1, max_rows_per_fetch.max(1)),
+        RAW_VECTOR_FETCHES_IN_FLIGHT,
+    )
+}
+
+/// `batch` cut into at most `num_slices` zero-copy slices of near-equal rows.
+fn slice_evenly(batch: RecordBatch, num_slices: usize) -> impl Iterator<Item = RecordBatch> {
+    let num_rows = batch.num_rows();
+    let rows_per_slice = num_rows.div_ceil(num_slices.max(1)).max(1);
+    (0..num_rows)
+        .step_by(rows_per_slice)
+        .map(move |offset| batch.slice(offset, rows_per_slice.min(num_rows - offset)))
+}
+
+/// Whether `column` holds a list of vectors per row rather than one vector.
+fn is_multivector_column(schema: &Schema, column: &str) -> Result<bool> {
+    let column_type = schema
+        .field(column)
+        .map(|field| field.data_type())
+        .ok_or_else(|| Error::invalid_input(format!("column {column} not found")))?;
+    Ok(matches!(
+        column_type,
+        DataType::List(_) | DataType::LargeList(_)
+    ))
 }
 
 /// Bytes of one element of a fixed-size vector field.
