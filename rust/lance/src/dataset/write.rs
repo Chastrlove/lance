@@ -1840,7 +1840,7 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     for field in &mut schema.fields {
         field.promote_blob_v2()?;
     }
-    schema.set_field_id(schema.max_field_id());
+    schema.try_set_field_id(schema.max_field_id())?;
     Ok(schema)
 }
 
