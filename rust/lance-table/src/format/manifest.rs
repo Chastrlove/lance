@@ -784,6 +784,13 @@ pub struct ManifestBuildConfig {
     pub migration_next_row_id: Option<u64>,
     /// Whether this commit atomically activates stable field IDs.
     pub activate_stable_field_ids: bool,
+    /// Row lineage sequences of the current manifest's fragments that live
+    /// outside the manifest, read ahead of the build. An update that rewrites
+    /// rows needs the existing row ids and created-at versions to carry each
+    /// row's lineage over, and a partial column rewrite needs the existing
+    /// last-updated-at versions; the build cannot read a data file itself. Only
+    /// consulted for fragments whose sequences are spilled.
+    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,6 +1123,7 @@ impl From<&Manifest> for pb::Manifest {
                     build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragment_tree: None,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
