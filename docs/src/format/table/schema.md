@@ -244,7 +244,10 @@ must honor that state. A legacy manifest sets neither value. A stable manifest s
 that sets only one is invalid. The reader flag for stable field IDs must remain unset because the
 feature does not change read behavior.
 
-A dataset changes to stable field IDs only through an explicit migration commit.
+A dataset changes to stable field IDs only through an explicit migration commit. Before activation,
+operators must ensure that all clients that can write to the dataset enforce writer feature flags,
+rejecting writes when they do not support a required flag. Clients that ignore these flags must no
+longer write to the dataset: they may discard the high-water mark and allow field IDs to be reused.
 
 A dataset cannot return to the legacy behavior. After activation, a restore must fail if it targets
 a version that does not set `max_allocated_field_id`. Before activation, different fields may have

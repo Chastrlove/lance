@@ -1212,7 +1212,7 @@ impl SelfDescribingFileReader for V1FileReader {
 #[cfg(test)]
 mod tests {
     use crate::feature_flags::{FLAG_STABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
-    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
 
@@ -1712,30 +1712,65 @@ mod tests {
 
     #[test]
     fn stable_field_id_high_water_mark_survives_dropped_references_and_round_trip() {
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            arrow_schema::DataType::Int64,
-            false,
-        )]);
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", arrow_schema::DataType::Int64, false),
+            ArrowField::new("b", arrow_schema::DataType::Int64, false),
+        ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(DataFile::new(
+            "ab.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
         let mut manifest = Manifest::new(
             schema,
-            Arc::new(vec![]),
+            Arc::new(vec![fragment]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
         manifest.activate_stable_field_ids();
-        manifest.max_allocated_field_id = Some(43);
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        assert_eq!(manifest.max_allocated_field_id, Some(1));
+
+        manifest.schema.fields.pop();
+        let file = &mut Arc::make_mut(&mut manifest.fragments)[0].files[0];
+        Arc::make_mut(&mut file.fields)[1] = TOMBSTONE_FIELD_ID;
+        manifest.update_max_field_id();
 
         assert_eq!(manifest.max_referenced_field_id(), 0);
-        assert_eq!(manifest.max_field_id(), 43);
+        assert_eq!(manifest.max_field_id(), 1);
 
-        let recovered = Manifest::try_from(pb::Manifest::from(&manifest)).unwrap();
-        assert_eq!(recovered.max_allocated_field_id, Some(43));
-        assert_eq!(recovered.max_field_id(), 43);
+        let encoded = manifest.serialized();
+        let mut recovered =
+            Manifest::try_from(pb::Manifest::decode(encoded.as_slice()).unwrap()).unwrap();
+        assert_eq!(recovered.max_allocated_field_id, Some(1));
+        assert_eq!(recovered.max_field_id(), 1);
+        assert_eq!(
+            recovered.fragments[0].files[0].fields.as_ref(),
+            &[0, TOMBSTONE_FIELD_ID]
+        );
+        assert_eq!(
+            recovered.fragments[0].files[0].column_indices.as_ref(),
+            &[0, 1]
+        );
         assert_eq!(recovered.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(recovered.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+
+        recovered.schema.fields.push(
+            Field::try_from(ArrowField::new("c", arrow_schema::DataType::Int64, false)).unwrap(),
+        );
+        let max_field_id = recovered.max_field_id();
+        recovered
+            .schema
+            .try_set_field_id(Some(max_field_id))
+            .unwrap();
+        assert_eq!(recovered.schema.field("c").unwrap().id, 2);
+        recovered.update_max_field_id();
+        assert_eq!(recovered.max_allocated_field_id, Some(2));
     }
 
     #[test]

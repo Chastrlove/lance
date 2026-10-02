@@ -3267,6 +3267,12 @@ impl Dataset {
     /// after fields and their files are dropped. Activation is one-way and
     /// idempotent.
     ///
+    /// Before calling this method, ensure that all clients that can write to the
+    /// dataset enforce writer feature flags, rejecting writes when they do not
+    /// support a required flag. Clients that ignore these flags must no longer
+    /// write to the dataset: they may discard the high-water mark and allow
+    /// field IDs to be reused. This method cannot enforce that client policy.
+    ///
     /// ```
     /// # use lance::{Dataset, Result};
     /// # async fn activate(dataset: &mut Dataset) -> Result<()> {
