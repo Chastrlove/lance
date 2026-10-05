@@ -837,12 +837,13 @@ impl Transaction {
                             updated.overlays = f.overlays.clone();
                             // A concurrent Project may have pruned files from the
                             // current fragment after this post-image was staged.
-                            // Match Project's rule: retain a file if any field in
-                            // it remains live, including mixed live/dropped files.
+                            // Spilled lineage fields are absent from the schema,
+                            // but their carriers must survive just as in Project.
+                            let spilled = updated.spilled_row_lineage_field_ids();
                             updated.files.retain(|file| {
-                                file.fields
-                                    .iter()
-                                    .any(|field_id| live_field_ids.contains(field_id))
+                                file.fields.iter().any(|field_id| {
+                                    live_field_ids.contains(field_id) || spilled.contains(field_id)
+                                })
                             });
                             if matches!(update_mode, Some(RewriteColumns)) {
                                 crate::format::overlay::tombstone_overlay_fields(
@@ -933,10 +934,11 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 // New fragments were staged against the same pre-Project schema.
                 for fragment in &mut new_fragments {
+                    let spilled = fragment.spilled_row_lineage_field_ids();
                     fragment.files.retain(|file| {
-                        file.fields
-                            .iter()
-                            .any(|field_id| live_field_ids.contains(field_id))
+                        file.fields.iter().any(|field_id| {
+                            live_field_ids.contains(field_id) || spilled.contains(field_id)
+                        })
                     });
                 }
 
@@ -1069,6 +1071,12 @@ impl Transaction {
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
+                    // If there is an FRI and the index uses addresses then we can
+                    // migrate fragment support.
+                    //
+                    // If there is an FRI and the index uses row ids (this is getting phased
+                    // out) then we can migrate fragment support without need for remap.
+                    let deferred_remap = frag_reuse_index.is_some();
                     for index in final_indices.iter_mut() {
                         // Its bitmap is lineage, not coverage, and a straddling
                         // group would fail the recalculation.
@@ -1077,7 +1085,7 @@ impl Transaction {
                         }
                         let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap = if results_are_row_addrs {
+                            *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
                                 // address-domain index cannot: its stored addresses point into
@@ -1913,6 +1921,7 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
             manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         }
+
         Ok((manifest, final_indices))
     }
 
@@ -1946,7 +1955,8 @@ mod tests {
     use crate::format::pb;
     use crate::format::{
         DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
-        RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
+        RowIdMeta,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
@@ -2727,6 +2737,149 @@ mod tests {
         );
     }
 
+    /// A tagged-table fixture for the CreateIndex gate: the manifest carries
+    /// the FRI flags and one tagged entry.
+    fn tagged_table_fixture() -> (Manifest, IndexMetadata) {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut current =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        current.fields.clear();
+        (manifest, current)
+    }
+
+    /// Build with the trim intent the maintenance path settles
+    /// (`FragReuseUpdate::Trim`), through the prepared entry.
+    fn build_trimmed(
+        transaction: &Transaction,
+        manifest: &Manifest,
+        indices: Vec<IndexMetadata>,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let config = default_build_config();
+        let prepared = transaction.prepare_indices(
+            Some(manifest),
+            indices,
+            &config,
+            None,
+            FragReuseUpdate::Trim,
+        )?;
+        transaction.build_manifest_prepared(Some(manifest), prepared, "txn", &config, None)
+    }
+
+    /// A CreateIndex replacing a tagged entry without the maintenance path's
+    /// derivation intent is a hand-built (possibly stale) trim: rejected.
+    #[test]
+    fn tagged_trim_without_intent_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![current],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("cleanup_frag_reuse_index"),
+            "{error}"
+        );
+    }
+
+    /// With the intent, exactly two shapes pass: the entry replaced, or the
+    /// entry removed outright (everything trimmed away; flags stay sticky).
+    #[rstest::rstest]
+    #[case::replace(true)]
+    #[case::remove(false)]
+    fn tagged_trim_with_intent_accepts_the_safe_shapes(#[case] replace: bool) {
+        let (manifest, current) = tagged_table_fixture();
+        let new_indices = if replace {
+            let mut replacement =
+                sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+            replacement.fields.clear();
+            vec![replacement]
+        } else {
+            vec![]
+        };
+        let expected_uuid = new_indices.first().map(|idx| idx.uuid);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let (new_manifest, final_indices) =
+            build_trimmed(&transaction, &manifest, vec![current]).unwrap();
+        let entries: Vec<_> = final_indices
+            .iter()
+            .filter(|idx| idx.name == crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .collect();
+        assert_eq!(entries.first().map(|idx| idx.uuid), expected_uuid);
+        // Sticky bits survive even full removal.
+        assert_ne!(
+            new_manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX,
+            0
+        );
+    }
+
+    /// Even with the intent, a trim whose removed identity no longer matches
+    /// the current entry was derived against a stale version: rejected, so a
+    /// replay cannot splice away a concurrent append.
+    #[test]
+    fn tagged_trim_with_stale_identity_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut stale = current.clone();
+        stale.uuid = Uuid::new_v4();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![stale],
+            },
+            None,
+        );
+        let error = build_trimmed(&transaction, &manifest, vec![current]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("stale"), "{error}");
+    }
+
+    /// A trim mixing user indices into the same commit is not a shape the
+    /// maintenance path produces; rejected even with the intent.
+    #[test]
+    fn tagged_trim_mixed_with_user_indices_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement, sample_index_metadata("id_idx")],
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let error = build_trimmed(&transaction, &manifest, vec![current]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
     #[test]
     fn frag_reuse_rewrite_guards_base_entry_version() {
         let mut manifest = sample_manifest();
@@ -3175,26 +3328,94 @@ mod tests {
     #[case::rewrite_columns(Some(UpdateMode::RewriteColumns))]
     fn test_update_build_manifest_does_not_restore_projected_files(
         #[case] update_mode: Option<UpdateMode>,
+        #[values(false, true)] with_spilled_lineage: bool,
     ) {
         let mut manifest = sample_manifest_with_fragments(0..3);
-        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
+        if with_spilled_lineage {
+            manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
+            manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS;
+            manifest.next_row_id = 126;
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                let start = fragment.id * 42;
+                fragment.physical_rows = Some(42);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&RowIdSequence::from(start..start + 42)).into(),
+                ));
+            }
+        }
+        let projected_file = DataFile::new(
+            "projected.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         Arc::make_mut(&mut manifest.fragments)[1].files = vec![projected_file.clone()];
 
         // Model an update staged before a projection removed field 1's file.
         let mut updated = manifest.fragments[1].clone();
-        updated.files.push(DataFile::new_legacy_from_fields(
+        updated.files.push(DataFile::new(
             "dropped.lance",
             vec![1],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
             None,
         ));
         updated.physical_rows = Some(42);
-        let inserted_projected_file =
-            DataFile::new_legacy_from_fields("inserted-projected.lance", vec![0], None);
+        let inserted_projected_file = DataFile::new(
+            "inserted-projected.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         let mut inserted = Fragment::new(0);
+        inserted.physical_rows = Some(42);
         inserted.files = vec![
             inserted_projected_file.clone(),
-            DataFile::new_legacy_from_fields("inserted-dropped.lance", vec![1], None),
+            DataFile::new(
+                "inserted-dropped.lance",
+                vec![1],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
         ];
+
+        let mut expected_updated_files = vec![projected_file];
+        let mut expected_inserted_files = vec![inserted_projected_file];
+        if with_spilled_lineage {
+            // Separate carriers ensure each lineage kind is retained even when
+            // the file has no field from the live schema.
+            for (fragment, expected_files) in [
+                (&mut updated, &mut expected_updated_files),
+                (&mut inserted, &mut expected_inserted_files),
+            ] {
+                fragment.row_id_meta = Some(RowIdMeta::Column);
+                fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column);
+                fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
+                for field_id in [
+                    ROW_ID_FIELD_ID,
+                    ROW_CREATED_AT_VERSION_FIELD_ID,
+                    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+                ] {
+                    let file = DataFile::new(
+                        format!("lineage-{field_id}.lance"),
+                        vec![field_id],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    );
+                    fragment.files.push(file.clone());
+                    expected_files.push(file);
+                }
+            }
+        }
 
         let transaction = Transaction::new(
             manifest.version,
@@ -3217,12 +3438,9 @@ mod tests {
             .unwrap();
 
         let fragment = &new_manifest.fragments[1];
-        assert_eq!(fragment.files, vec![projected_file]);
+        assert_eq!(fragment.files, expected_updated_files);
         assert_eq!(fragment.physical_rows, Some(42));
-        assert_eq!(
-            new_manifest.fragments[3].files,
-            vec![inserted_projected_file]
-        );
+        assert_eq!(new_manifest.fragments[3].files, expected_inserted_files);
         assert_eq!(new_manifest.max_field_id(), 0);
     }
 

@@ -119,6 +119,15 @@ fn blob_threshold_from_metadata(
     Ok(threshold)
 }
 
+pub(super) fn validate_blob_threshold_metadata(schema: &Schema) -> Result<()> {
+    for field in schema.fields_pre_order().filter(|field| field.is_blob_v2()) {
+        blob_inline_threshold_from_metadata(&field.metadata, &field.name)?;
+        blob_dedicated_threshold_from_metadata(&field.metadata, &field.name)?;
+        blob_pack_file_threshold_from_metadata(&field.metadata, &field.name)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ResolvedExternalBase {
     pub base_id: u32,
@@ -8562,7 +8571,10 @@ mod tests {
                     .requests
                     .iter()
                     .filter(|request| request.path == blob.source.path)
-                    .all(|request| request.method != "get_opts" || request.range.is_some()),
+                    .all(|request| {
+                        request.method != "head"
+                            && (request.method != "get_opts" || request.range.is_some())
+                    }),
                 "{stats:?}"
             );
         }
@@ -8983,7 +8995,7 @@ mod tests {
         let size_queries = stats
             .requests
             .iter()
-            .filter(|request| request.method == "get_opts" && request.range.is_none())
+            .filter(|request| request.method == "head")
             .count();
         // A descriptor without a length still needs one size query per selection.
         let expected_size_queries = if desc.column(2).as_primitive::<UInt64Type>().value(0) == 0 {
@@ -9719,6 +9731,134 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("expected a non-negative integer that fits in usize")
+        );
+    }
+
+    #[rstest]
+    #[case::negative_inline(BLOB_INLINE_SIZE_THRESHOLD_META_KEY, "-5")]
+    #[case::invalid_dedicated(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, "abc")]
+    #[case::zero_dedicated(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, "0")]
+    #[case::zero_pack_file(BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, "0")]
+    #[tokio::test]
+    async fn test_blob_v2_empty_create_rejects_invalid_threshold_metadata(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) {
+        let dataset_dir = TempDir::default();
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.insert(key.to_string(), value.to_string());
+        field = field.with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+
+        let err = Dataset::write(
+            reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains(&format!("{key}=\"{value}\"")));
+        assert!(Dataset::open(&dataset_dir.path_str()).await.is_err());
+    }
+
+    #[rstest]
+    #[case::negative_inline(BLOB_INLINE_SIZE_THRESHOLD_META_KEY, "-5")]
+    #[case::invalid_dedicated(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, "abc")]
+    #[case::zero_pack_file(BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, "0")]
+    #[tokio::test]
+    async fn test_blob_v2_field_metadata_rejects_invalid_threshold(
+        #[case] key: &str,
+        #[case] value: &str,
+    ) {
+        let dataset_dir = TempDir::default();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let version = dataset.version_id();
+
+        let err = dataset
+            .update_field_metadata()
+            .update("blob", [(key, value)])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains(&format!("{key}=\"{value}\"")));
+        assert_eq!(dataset.version_id(), version);
+        let reopened = Dataset::open(&dataset_dir.path_str()).await.unwrap();
+        assert_eq!(reopened.version_id(), version);
+        assert!(
+            !reopened
+                .schema()
+                .field("blob")
+                .unwrap()
+                .metadata
+                .contains_key(key)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_overwrite_rejects_invalid_threshold_metadata() {
+        let dataset_dir = TempDir::default();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+            "-5".to_string(),
+        );
+        field = field.with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+        let err = Dataset::write(
+            reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains(BLOB_INLINE_SIZE_THRESHOLD_META_KEY)
+        );
+        assert_eq!(
+            Dataset::open(&dataset_dir.path_str())
+                .await
+                .unwrap()
+                .version_id(),
+            dataset.version_id()
         );
     }
 
