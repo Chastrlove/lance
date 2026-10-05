@@ -335,13 +335,14 @@ impl StorageOptions {
         Self(opts)
     }
 
-    /// Add values from the environment to storage options
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
     pub fn with_env_azure(&mut self) {
-        for (os_key, os_value) in &ENV_OPTIONS.0 {
-            if !self.0.contains_key(os_key) {
-                self.0.insert(os_key.clone(), os_value.clone());
-            }
-        }
+        self.merge_env_options(&ENV_OPTIONS.0, |key| {
+            AzureConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
     /// Subset of options relevant for azure storage

@@ -356,23 +356,22 @@ impl ObjectStoreProvider for GcsStoreProvider {
 }
 
 impl StorageOptions {
-    /// Add values from the environment to storage options
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
     pub fn with_env_gcs(&mut self) {
+        self.merge_env_options(std::env::vars_os(), |key| {
+            GoogleConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
+        // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token.
+        let token_key = "google_storage_token";
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                let lowercase_key = key.to_ascii_lowercase();
-                let token_key = "google_storage_token";
-
-                if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase_key) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
-                // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token
-                else if lowercase_key == token_key && !self.0.contains_key(token_key) {
-                    self.0.insert(token_key.to_string(), value.to_string());
-                }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && key.eq_ignore_ascii_case(token_key)
+                && !self.0.contains_key(token_key)
+            {
+                self.0.insert(token_key.to_string(), value.to_string());
             }
         }
     }

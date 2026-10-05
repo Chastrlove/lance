@@ -614,18 +614,14 @@ impl AwsCredentialAdapter {
 impl StorageOptions {
     /// Add values from the environment to storage options.
     ///
-    /// Only adds keys that are not already present, so explicitly-set options
-    /// (including empty-string sentinels) always take precedence over env vars.
+    /// Explicitly-set options (including aliases, case variants, and empty-string
+    /// sentinels) always take precedence over env vars.
     pub fn with_env_s3(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
-                && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
-                && !self.0.contains_key(config_key.as_ref())
-            {
-                self.0
-                    .insert(config_key.as_ref().to_string(), value.to_string());
-            }
-        }
+        self.merge_env_options(std::env::vars_os(), |key| {
+            AmazonS3ConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
     /// Subset of options relevant for s3 storage
