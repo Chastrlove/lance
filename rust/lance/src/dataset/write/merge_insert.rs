@@ -47,7 +47,7 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
@@ -73,8 +73,8 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
-use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
 use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
@@ -104,7 +104,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self},
 };
-use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
+use lance_arrow::json::convert_json_columns;
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
@@ -124,8 +124,7 @@ use lance_datafusion::{
     spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
 };
-#[cfg(test)]
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
@@ -557,6 +556,20 @@ pub enum SourceDedupeBehavior {
     FirstSeen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanFileVersion(ConcreteFileVersion);
+
+impl PartialOrd for PlanFileVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // DataFusion requires extension-node parameters to have a deterministic
+        // structural order. This is only plan identity; operation capability
+        // decisions always match on ConcreteFileVersion directly.
+        self.0
+            .to_data_file_numbers()
+            .partial_cmp(&other.0.to_data_file_numbers())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 struct MergeInsertParams {
     // The column(s) to join on
@@ -600,6 +613,16 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
+    // Exact output data file version. The manifest default is used when absent.
+    data_storage_version: Option<PlanFileVersion>,
+}
+
+impl MergeInsertParams {
+    fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
+        self.data_storage_version
+            .map(|version| version.0)
+            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+    }
 }
 
 /// Where the per-fragment patch tasks in
@@ -758,6 +781,7 @@ impl MergeInsertBuilder {
                 target_bases: None,
                 target_base_names_or_paths: None,
                 target_all_bases: None,
+                data_storage_version: None,
             },
         })
     }
@@ -910,6 +934,27 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Set the exact V2 data file version for rows written by this merge.
+    ///
+    /// If omitted, the dataset's default write version is used. The default
+    /// remains unchanged. Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::MergeInsertBuilder};
+    /// # use lance_file::version::LanceFileVersion;
+    /// # use std::sync::Arc;
+    /// # fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?
+    ///     .data_storage_version(LanceFileVersion::V2_2)
+    ///     .try_build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn data_storage_version(&mut self, version: LanceFileVersion) -> &mut Self {
+        self.params.data_storage_version = Some(PlanFileVersion(version.resolve()));
+        self
+    }
+
     /// Write new fragments produced by this merge insert to these base IDs.
     ///
     /// New data files are distributed across the target bases round-robin,
@@ -952,6 +997,14 @@ impl MergeInsertBuilder {
 
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
+        let write_version = self.params.write_version(&self.dataset);
+        versions::validate_write_version(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            write_version,
+        )?;
         if !self.params.insert_not_matched
             && self.params.when_matched == WhenMatched::DoNothing
             && self.params.delete_not_matched_by_source == WhenNotMatchedBySource::Keep
@@ -973,9 +1026,11 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        let mut params = self.params.clone();
+        params.data_storage_version = Some(PlanFileVersion(write_version));
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
-            params: self.params.clone(),
+            params,
         })
     }
 }
@@ -1132,6 +1187,60 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
     }
 }
 
+/// Re-expose every dataset column the source does not carry under its bare
+/// dataset field name, taking the value from the `target` side of the join.
+///
+/// `df` is the target-joined-source plan, whose target columns are qualified
+/// `target` and whose source columns are qualified `source`. For matched rows a
+/// filled column carries the existing target value (preserving non-source
+/// columns on update); for unmatched source rows the outer join leaves the
+/// target side NULL, so inserts get NULL. The unqualified name matches the
+/// dataset field and makes it a normal data column from the write exec's
+/// perspective.
+///
+/// A filled column replaces `target.X` in place rather than being appended, so
+/// the output is the join schema with some columns unqualified, in the same
+/// order, and the same width. Appending instead would leave both `target.X` and
+/// a bare `X` in scope, which downstream column references read as ambiguous.
+fn fill_missing_target_columns(
+    df: DataFrame,
+    dataset_schema: &Schema,
+    source_field_names: &HashSet<String>,
+) -> Result<DataFrame> {
+    let missing_from_source: HashSet<&str> = dataset_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .filter(|name| !source_field_names.contains(*name))
+        .collect();
+    if missing_from_source.is_empty() {
+        return Ok(df);
+    }
+
+    // Keep this a single projection. `DataFrame::with_column` would express the
+    // fill one field at a time and read better, but each call re-lists every
+    // column in a fresh `Projection`, so a per-field loop nests N of them and
+    // the optimizer's recursive walk overflows the stack on wide tables (#9504).
+    let target_qualifier = TableReference::bare("target");
+    let projection = df
+        .schema()
+        .iter()
+        .map(|(qualifier, field)| {
+            let expr = logical_expr::col(DFColumn::from((qualifier, field)));
+            if qualifier == Some(&target_qualifier)
+                && missing_from_source.contains(field.name().as_str())
+            {
+                // An alias is unqualified, which is what drops the `target.`
+                // prefix and makes this a plain data column.
+                expr.alias(field.name())
+            } else {
+                expr
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(df.select(projection)?)
+}
+
 impl MergeInsertJob {
     pub async fn execute_reader(
         self,
@@ -1145,11 +1254,7 @@ impl MergeInsertJob {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
         let target_schema = self.dataset.schema();
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
+        let version = self.params.write_version(&self.dataset);
         let mut options = versions::schema_compare_options(version);
         options.compare_nullability = NullabilityComparison::Ignore;
         // Merge columns are matched by name, so a complete source remains a
@@ -1531,6 +1636,7 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
+        write_version: ConcreteFileVersion,
     ) -> Result<PatchedFragments> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
@@ -1542,9 +1648,11 @@ impl MergeInsertJob {
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
         });
-        // 25 MiB hard cap on batch size.  DataFusion's sort cannot spill a
-        // single batch that is larger than the memory pool, so we must
-        // rechunk oversized batches before they reach the sort.
+        // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
+        // sort overhead and spill/merge reservation. SortExec must reserve an
+        // entire input batch even when spilling is enabled. This cap reduces
+        // reservation pressure but cannot guarantee success with a small pool
+        // or competing consumers; oversized single rows are rejected.
         const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
         let sorted = session_ctx
             .read_one_shot(source)?
@@ -1552,7 +1660,7 @@ impl MergeInsertJob {
             .sort(vec![col(ROW_ADDR).sort(true, true)])?;
         let sorted_plan = sorted.create_physical_plan().await?;
         // Walk the physical plan and insert HardCapBatchSizeExec below every
-        // sort node so each input batch fits in the memory pool.
+        // sort node to enforce the input cap (deep-copying oversized slices).
         let capped_plan = sorted_plan
             .transform_down(|node| {
                 if node.downcast_ref::<SortExec>().is_some() {
@@ -1621,8 +1729,9 @@ impl MergeInsertJob {
                 mut batches: Vec<RecordBatch>,
                 patched: Arc<PatchSink>,
                 reservation_size: usize,
-                current_version: u64,
+                versions: (u64, ConcreteFileVersion),
             ) -> Result<usize> {
+                let (current_version, write_version) = versions;
                 // batches still have _rowaddr
                 let write_schema = batches[0]
                     .schema()
@@ -1684,10 +1793,8 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let data_storage_version =
-                        dataset.manifest().data_storage_format.lance_file_format();
                     let mut writer = versions::open_writer(
-                        data_storage_version,
+                        write_version,
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
@@ -1709,23 +1816,16 @@ impl MergeInsertJob {
                             Err(e) => Err(e),
                         })?;
 
-                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary/JSONB)
-                    // before writing. Without this, Utf8 data is written raw while the
-                    // schema says LargeBinary, causing decoder panics on subsequent reads.
-                    let needs_json_conversion = batches[0]
-                        .schema()
-                        .fields()
-                        .iter()
-                        .any(|f| is_arrow_json_field(f) || has_json_fields(f));
-                    if needs_json_conversion {
-                        for batch in batches.iter_mut() {
-                            *batch = convert_json_columns(batch).map_err(Error::from)?;
-                        }
-                    }
-
+                    let source_version = metadata
+                        .referenced_lance_files()
+                        .next()
+                        .map(|file| file.file_version())
+                        .transpose()?
+                        .unwrap_or_else(|| {
+                            dataset.manifest.data_storage_format.lance_file_format()
+                        });
                     if let Some(batch_size) =
-                        versions::row_group_size_for_rewrite(data_storage_version, &fragment)
-                            .await?
+                        versions::row_group_size_for_rewrite(source_version, &fragment).await?
                     {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
@@ -1760,11 +1860,12 @@ impl MergeInsertJob {
                     let update_schema = batches[0].schema();
                     let read_columns = update_schema.field_names();
                     let mut updater = fragment
-                        .updater(
+                        .updater_with_version(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
                             None,
                             None,
+                            write_version,
                         )
                         .await?;
 
@@ -1828,11 +1929,16 @@ impl MergeInsertJob {
                         updated_offsets.sort_unstable();
                         updated_offsets.dedup();
 
+                        // The fragment's existing versions may be spilled to a
+                        // data file, which the refresh cannot read itself.
+                        let spilled_lineage =
+                            load_spilled_row_lineage(&dataset, [&updated_fragment]).await?;
                         lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                             &mut updated_fragment,
                             &updated_offsets,
                             current_version,
                             dataset.manifest.version,
+                            &spilled_lineage,
                         )?;
                     }
 
@@ -1847,6 +1953,7 @@ impl MergeInsertJob {
                 new_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
                 target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
+                write_version: ConcreteFileVersion,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -1872,7 +1979,7 @@ impl MergeInsertJob {
                 )?;
 
                 let (fragments, _) = write_fragments_internal(
-                    dataset.manifest.data_storage_format.lance_file_format(),
+                    write_version,
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
                     &dataset.base,
@@ -1960,7 +2067,7 @@ impl MergeInsertJob {
                         batches,
                         patched.clone(),
                         memory_size,
-                        current_version,
+                        (current_version, write_version),
                     );
                     tasks.spawn(fut);
                 }
@@ -1971,6 +2078,7 @@ impl MergeInsertJob {
                         new_fragments.clone(),
                         memory_size,
                         target_bases_info.clone(),
+                        write_version,
                     );
                     tasks.spawn(fut);
                 }
@@ -2374,6 +2482,17 @@ impl MergeInsertJob {
             .iter()
             .map(|f| f.name().clone())
             .collect();
+        let source_blob_columns = self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| {
+                source_field_names.contains(&field.name)
+                    && crate::dataset::optimize::field_contains_blob_v2(field)
+            })
+            .map(|field| field.name.clone())
+            .collect();
         // Inject a sentinel literal column so we can reliably determine, after the join,
         // whether the source side contributed a row.  This is NULL-safe: even when every
         // ON column is NULL the sentinel lets us distinguish a source-only row from a
@@ -2398,31 +2517,15 @@ impl MergeInsertJob {
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
             )?;
 
-        // Partial-schema upsert: for every dataset column missing from the
-        // source, add a synthetic unqualified column that copies the target
-        // side's value for that column. For matched rows this carries the
-        // existing target value (preserving non-source columns on update);
-        // for unmatched source rows (inserts) the outer join leaves the
-        // target side NULL, so inserts get NULL for missing columns. The
-        // unqualified name matches the dataset field and becomes a normal
-        // data column from the write exec's perspective.
-        //
-        // We iterate the dataset schema in order so that the resulting
-        // physical plan is deterministic and easy to inspect in tests.
+        // Partial-schema upsert: fill the dataset columns the source does not
+        // carry from the target side of the join.
         //
         // `RewriteColumns` patches the source columns into the fragments that
         // already hold the matched rows, so the missing columns keep their
         // stored values and must not be filled here. Skipping the fill is also
         // what keeps them out of the target scan's projection.
         if write_sink == WriteSink::RewriteRows {
-            for field in dataset_schema.fields() {
-                if !source_field_names.contains(field.name()) {
-                    df = df.with_column(
-                        field.name(),
-                        logical_expr::col(format!("target.\"{}\"", field.name())),
-                    )?;
-                }
-            }
+            df = fill_missing_target_columns(df, &dataset_schema, &source_field_names)?;
         }
 
         let (session_state, logical_plan) = df.into_parts();
@@ -2433,6 +2536,7 @@ impl MergeInsertJob {
             self.params.clone(),
             source_skipped_duplicates,
             write_sink,
+            source_blob_columns,
         );
         let logical_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),
@@ -2830,6 +2934,7 @@ impl MergeInsertJob {
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
                 target_bases_info,
+                self.params.write_version(&self.dataset),
             )
             .await?;
 
@@ -2853,10 +2958,7 @@ impl MergeInsertJob {
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
-                self.dataset
-                    .manifest
-                    .data_storage_format
-                    .lance_file_format(),
+                self.params.write_version(&self.dataset),
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
@@ -3762,15 +3864,74 @@ mod tests {
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use mock_instant::thread_local::MockClock;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use tokio::sync::{Barrier, Notify};
+    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    /// The fill's plan depth must not grow with the number of columns the
+    /// source omits. Building it with a `DataFrame::with_column` per missing
+    /// field — the obvious way, and what this did before #9504 — nests one
+    /// `Projection` per column; the optimizer's recursive walk over that chain
+    /// aborted the process on a 315-column table. No other test in this suite
+    /// builds a partial-schema merge wide enough to notice, so a regression to
+    /// that form would surface in production rather than here.
+    ///
+    /// Only the depth is asserted. What the fill produces is covered by the
+    /// partial-schema merge tests below.
+    #[test]
+    fn test_fill_missing_target_columns_depth_is_width_independent() {
+        fn fill_depth(num_cols: usize) -> usize {
+            fn depth(plan: &LogicalPlan) -> usize {
+                1 + plan.inputs().iter().map(|i| depth(i)).max().unwrap_or(0)
+            }
+
+            let ctx = SessionContext::new();
+            let dataset_schema = Schema::new(
+                (0..num_cols)
+                    .map(|i| Field::new(format!("c{i}"), DataType::Int32, true))
+                    .collect::<Vec<_>>(),
+            );
+            let target = Arc::new(
+                MemTable::try_new(Arc::new(dataset_schema.clone()), vec![vec![]]).unwrap(),
+            );
+            // The source carries only the join key, so every other column is
+            // filled from the target side.
+            let source = Arc::new(
+                MemTable::try_new(
+                    Arc::new(Schema::new(vec![Field::new("c0", DataType::Int32, true)])),
+                    vec![vec![]],
+                )
+                .unwrap(),
+            );
+            let joined = ctx
+                .read_table(target)
+                .unwrap()
+                .alias("target")
+                .unwrap()
+                .join(
+                    ctx.read_table(source).unwrap().alias("source").unwrap(),
+                    JoinType::Left,
+                    &["\"c0\""],
+                    &["\"c0\""],
+                    None,
+                )
+                .unwrap();
+            let source_field_names: HashSet<String> = std::iter::once("c0".to_string()).collect();
+            let filled =
+                fill_missing_target_columns(joined, &dataset_schema, &source_field_names).unwrap();
+            depth(filled.logical_plan())
+        }
+
+        assert_eq!(fill_depth(8), fill_depth(512));
     }
 
     #[test]
@@ -3845,6 +4006,7 @@ mod tests {
             Box::pin(update_stream),
             dataset.manifest().version + 1,
             None,
+            dataset.manifest.data_storage_format.lance_file_format(),
         )
         .await
         .unwrap_err();
@@ -4313,6 +4475,122 @@ mod tests {
         pairs.sort_unstable();
 
         assert_eq!(pairs, vec![(1, 10), (2, 200), (3, 300), (4, 400)]);
+    }
+
+    #[rstest::rstest]
+    #[case::full(false, false)]
+    #[case::column_patch(true, false)]
+    #[case::partial_column_patch(true, true)]
+    #[tokio::test]
+    async fn merge_insert_uses_explicit_exact_version(
+        #[case] partial: bool,
+        #[case] partial_rows: bool,
+        #[values(false, true)] indexed: bool,
+        #[values(
+            None,
+            Some(LanceFileVersion::V2_1),
+            Some(LanceFileVersion::V2_2),
+            Some(LanceFileVersion::V2_3)
+        )]
+        target: Option<LanceFileVersion>,
+    ) {
+        let mut dataset = create_test_dataset("memory://", LanceFileVersion::V2_0, false).await;
+        if indexed {
+            Arc::make_mut(&mut dataset)
+                .create_index(
+                    &["key"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let original_paths = dataset
+            .manifest
+            .fragments
+            .iter()
+            .flat_map(Fragment::referenced_lance_files)
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let mut new_batch = create_new_batch(create_test_schema());
+        if partial {
+            new_batch = new_batch.project(&[0, 1]).unwrap();
+        }
+        if partial_rows {
+            new_batch = new_batch.slice(1, new_batch.num_rows() - 1);
+        }
+        let schema = new_batch.schema();
+        let mut builder = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()]).unwrap();
+        builder.when_matched(WhenMatched::UpdateAll);
+        if partial {
+            builder.when_not_matched(WhenNotMatched::DoNothing);
+            if !indexed {
+                builder.write_mode(MergeInsertWriteMode::RewriteColumns);
+            }
+        }
+        if let Some(target) = target {
+            builder.data_storage_version(target);
+        }
+        let (dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(new_batch)], schema))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, if partial { 0 } else { 3 });
+        let updated_rows = if partial_rows { 2 } else { 3 };
+        assert_eq!(stats.num_updated_rows, updated_rows);
+        assert_eq!(
+            dataset
+                .count_rows(Some("value = 2".to_string()))
+                .await
+                .unwrap(),
+            if partial { updated_rows as usize } else { 6 }
+        );
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .filter(|file| !original_paths.contains(&file.path))
+                .all(|file| file.file_version().unwrap()
+                    == target.unwrap_or(LanceFileVersion::V2_0).resolve())
+        );
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0,
+            target.is_some()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn merge_insert_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let dataset = create_test_dataset("memory://", source, false).await;
+        let error = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+            .unwrap()
+            .data_storage_version(target)
+            .try_build()
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
     }
 
     #[rstest::rstest]
@@ -15069,6 +15347,113 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_preserves_carried_external_blob() {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        let dataset_dir = TempStrDir::default();
+        let external_dir = TempStrDir::default();
+        let external_path = format!("{external_dir}/external.bin");
+        std::fs::write(&external_path, b"external blob").unwrap();
+        let external_uri = Url::from_file_path(&external_path).unwrap().to_string();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            blob_field("payload", true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_uri(external_uri.clone()).unwrap();
+        blobs.push_bytes(b"internal blob").unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                blobs.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["a", "other"])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &dataset_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 1,
+                    allow_external_blob_outside_bases: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let source = record_batch!(("id", Int64, [1]), ("tag", Utf8, ["updated"])).unwrap();
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, _) = job
+            .execute_reader(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            ))
+            .await
+            .unwrap();
+
+        let result = dataset
+            .scan()
+            .project(&["id", "tag"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let ids = result["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let row = ids.values().iter().position(|id| *id == 1).unwrap();
+        assert_eq!(result["tag"].as_string::<i32>().value(row), "updated");
+        let blobs = dataset
+            .take_blobs_by_indices(&[row as u64], "payload")
+            .await
+            .unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), lance_core::datatypes::BlobKind::External);
+        assert_eq!(blob.uri(), Some(external_uri.as_str()));
+        assert_eq!(blob.read().await.unwrap().as_ref(), b"external blob");
+
+        let mut source_blob = BlobArrayBuilder::new(1);
+        source_blob.push_uri(external_uri).unwrap();
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                source_blob.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["another update"])),
+            ],
+        )
+        .unwrap();
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let error = job
+            .execute_reader(RecordBatchIterator::new(vec![Ok(source)], schema))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("in field 'payload' is outside registered external bases"),
+            "{error:?}"
         );
     }
 

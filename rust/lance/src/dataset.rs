@@ -105,9 +105,9 @@ mod take;
 pub mod transaction {
     pub use lance_table::transaction::{
         DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
-        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
-        validate_operation,
+        RewrittenIndex, TaggedRewriteAssembly, Transaction, TransactionBuilder, UpdateMap,
+        UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
+        translate_schema_metadata_updates, validate_operation,
     };
 }
 pub mod udtf;
@@ -135,8 +135,8 @@ use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::io::commit::{
-    DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
-    commit_transaction, detect_overlapping_fragments,
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    default_commit_retry_timeout, detect_overlapping_fragments,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -156,6 +156,7 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -520,7 +521,10 @@ impl Dataset {
         DatasetBuilder::from_uri(uri).load().await
     }
 
-    /// Check out a dataset version with a ref
+    /// Check out a dataset version with a ref.
+    ///
+    /// In reference contexts, `"main"` is an alias for the default branch and
+    /// is equivalent to `None`.
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let reference: refs::Ref = version.into();
         match reference {
@@ -578,7 +582,9 @@ impl Dataset {
         );
     }
 
-    /// Check out the latest version of the branch
+    /// Check out the latest version of the branch.
+    ///
+    /// Use `"main"` to check out the latest version of the default branch.
     pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
         self.checkout_by_ref(None, Some(branch)).await
     }
@@ -598,12 +604,16 @@ impl Dataset {
     /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
     /// failure if we use the same name to `create_branch`. In that case, you need to call
     /// `force_delete_branch` to interactively clean up the zombie dataset.
+    ///
+    /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     pub async fn create_branch(
         &mut self,
         branch: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        refs::check_valid_branch(branch)?;
+
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let source_location = self
@@ -670,16 +680,19 @@ impl Dataset {
         version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<Self> {
+        let standardized_branch = branch.and_then(refs::standardize_branch);
         // Reject malformed names at the boundary (mirroring the branch CRUD
         // paths) so they fail as InvalidRef instead of tripping the wrong-chain
         // check below
-        if let Some(branch_name) = branch
-            && !Branches::is_main_branch(branch)
+        if let Some(branch_name) = standardized_branch.as_deref()
+            && !Branches::is_main_branch(Some(branch_name))
         {
             refs::check_valid_branch(branch_name)?;
         }
 
-        let new_location = self.branch_location().find_branch(branch)?;
+        let new_location = self
+            .branch_location()
+            .find_branch(standardized_branch.as_deref())?;
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
@@ -695,7 +708,7 @@ impl Dataset {
                 .await?
         };
 
-        if self.already_checked_out(&manifest_location, branch) {
+        if self.already_checked_out(&manifest_location, standardized_branch.as_deref()) {
             return Ok(self.clone());
         }
 
@@ -711,8 +724,7 @@ impl Dataset {
         // means the commit handler resolved against a different chain (for
         // example an external manifest store that ignores branch-qualified
         // paths); error loudly rather than hand back another branch's data.
-        let requested_branch = branch.and_then(refs::standardize_branch);
-        if manifest.branch.as_deref() != requested_branch.as_deref() {
+        if manifest.branch.as_deref() != standardized_branch.as_deref() {
             return Err(Error::internal(format!(
                 "checkout of branch '{}' at version {} resolved a manifest belonging to branch '{}'",
                 refs::normalize_branch(branch),
@@ -792,10 +804,14 @@ impl Dataset {
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
-            read_struct(object_reader.as_ref(), offset).await
+            let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+            manifest.detach_sparse_inline_row_ids(manifest_size - offset);
+            Ok(manifest)
         }?;
 
         ensure_can_read_manifest(&manifest)?;
+
+        versions::check_manifest_storage_version(&mut manifest)?;
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
@@ -1666,7 +1682,7 @@ impl Dataset {
             &transaction,
             write_config,
             commit_config,
-            DEFAULT_COMMIT_RETRY_TIMEOUT,
+            default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
         )
@@ -3320,6 +3336,12 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+            &src_ds.object_store,
+            &src_ds.manifest_location,
+            &src_ds.manifest,
+        )
+        .await?;
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -3411,7 +3433,8 @@ impl Dataset {
             .with_object_store(target_store.clone())
             .with_source_store(src_ds.object_store.clone())
             .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .with_deep_clone_files_copied();
         let new_ds = builder.execute(txn).await?;
         Ok(new_ds)
     }
@@ -3444,13 +3467,8 @@ impl Dataset {
     /// Collect all (relative_path, path) of the dataset files.
     async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
+        let mut blob_dirs = HashSet::new();
         for fragment in self.manifest.fragments.iter() {
-            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                return Err(Error::internal(format!(
-                    "External row_id_meta is not supported yet. external file path: {}",
-                    external_file.path
-                )));
-            }
             for data_file in fragment.referenced_lance_files() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
@@ -3463,8 +3481,36 @@ impl Dataset {
                 };
                 file_paths.push((
                     format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_root,
+                    base_root.clone(),
                 ));
+
+                if !data_file
+                    .schema(self.schema())
+                    .fields_pre_order()
+                    .any(|field| field.is_blob_v2())
+                {
+                    continue;
+                }
+
+                // Blob v2 sidecars are not listed in the manifest. Their directory is
+                // derived from the owning data file, so enumerate it to copy packed and
+                // dedicated payloads without decoding blob descriptors. External blobs
+                // remain caller-owned references and are deliberately not collected.
+                let data_file_key = blob::data_file_key_from_path(data_file.path.as_str());
+                let relative_blob_dir = format!("{}/{}", DATA_DIR, data_file_key);
+                let blob_dir = base_root.clone().join(DATA_DIR).join(data_file_key);
+                // Overlays can make the same data file reachable from multiple fragments.
+                if blob_dirs.insert(blob_dir.clone()) {
+                    let mut stream = self.object_store.read_dir_all(&blob_dir, None);
+                    while let Some(meta) = stream.next().await.transpose()? {
+                        if let Some(filename) = meta.location.filename() {
+                            file_paths.push((
+                                format!("{}/{}", relative_blob_dir, filename),
+                                base_root.clone(),
+                            ));
+                        }
+                    }
+                }
             }
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
@@ -3682,6 +3728,15 @@ impl Dataset {
     /// underlying storage. In order to remove the data, you must subsequently
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
+    /// The schema a [`Self::drop_columns`] of `columns` would project to,
+    /// with every validation that drop performs and no mutation of its own.
+    ///
+    /// For a caller that must not write anything until the whole projection
+    /// is known to be valid against this revision.
+    pub fn plan_drop_columns(&self, columns: &[&str]) -> Result<Schema> {
+        schema_evolution::plan_drop_columns(self, columns)
+    }
+
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await
@@ -4072,6 +4127,10 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
+    /// This commit is a tagged fragment-reuse-index trim derived by
+    /// `cleanup_frag_reuse_index` against the current manifest entry; see
+    /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
+    tagged_frag_reuse_trim: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -4084,6 +4143,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         }
     }
 }
@@ -4099,6 +4159,19 @@ impl ManifestWriteConfig {
         self
     }
 
+    /// Mark this commit as a tagged fragment-reuse-index trim derived by the
+    /// maintenance path; required for `build_manifest` to accept the shape.
+    pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
+        self.tagged_frag_reuse_trim = true;
+        self
+    }
+
+    /// Whether this commit is the tagged fragment reuse trim the maintenance
+    /// path derived against the current entry (`FragReuseUpdate::Trim`).
+    pub(crate) fn tagged_frag_reuse_trim(&self) -> bool {
+        self.tagged_frag_reuse_trim
+    }
+
     /// Resolve into the config `Transaction::build_manifest` consumes.
     ///
     /// The timestamp is resolved here rather than during the build so it goes
@@ -4112,6 +4185,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            spilled_row_lineage: Default::default(),
         }
     }
 }
@@ -4155,6 +4229,9 @@ pub(crate) async fn write_manifest_file(
     may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
+    if let Some(indices) = &indices {
+        lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
+    }
     // Every manifest write funnels through here, including restore and clone,
     // which rebuild a manifest from a stored one rather than from an Arrow
     // schema, so this is where the invariant holds for a schema that never
@@ -4178,6 +4255,8 @@ pub(crate) async fn write_manifest_file(
             .schema
             .verify_primary_key()
             .map_err(CommitError::OtherError)?;
+        blob::validate_blob_threshold_metadata(&manifest.schema)
+            .map_err(CommitError::OtherError)?;
     }
 
     if config.auto_set_feature_flags {
@@ -4190,7 +4269,19 @@ pub(crate) async fn write_manifest_file(
             use_stable_row_ids,
             config.disable_transaction_file,
         )?;
+        crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag(
+            manifest,
+            indices.as_deref().unwrap_or_default(),
+        );
     }
+    // After the flag reset, which restores the stable-row-id flag a shallow clone
+    // masks. Here rather than in `build_manifest`, which restore and clone bypass.
+    crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
+        manifest,
+        indices.as_deref().unwrap_or_default(),
+    )?;
+
+    versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
