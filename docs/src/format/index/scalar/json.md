@@ -6,9 +6,7 @@ values into one Arrow array, and hands that array to an ordinary scalar index â€
 the *target index* â€” which does all of the storage and searching.
 
 A JSON value at a given path has no fixed type, so the wrapper has to pick one
-Arrow type for the whole column before the target index can be built. The
-variants it can pick are the image of the JSONB type tags, so every JSON value
-type is covered:
+Arrow type for the whole column before the target index can be built:
 
 | JSONB type tag    | `JsonTargetDataType`                 | Value stored in the target index      |
 |-------------------|--------------------------------------|---------------------------------------|
@@ -16,7 +14,6 @@ type is covered:
 | `Int64`           | `JSON_TARGET_DATA_TYPE_INT64`        | The decoded integer                   |
 | `Float64`         | `JSON_TARGET_DATA_TYPE_FLOAT64`      | The decoded float                     |
 | `String`          | `JSON_TARGET_DATA_TYPE_UTF8`         | The decoded string, unquoted          |
-| `Array`, `Object` | `JSON_TARGET_DATA_TYPE_LARGE_BINARY` | The subtree, re-serialized as JSONB   |
 
 A JSON null, or a document whose path is absent, is indexed as a null.
 

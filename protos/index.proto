@@ -251,10 +251,9 @@ message HnswParameters {
  * the target index.
  *
  * A JSON value has no fixed type, so a JSON index decodes the value at its path
- * into a single Arrow type and trains the target index on that. The variants
- * below are the image of the JSONB type tags: a JSON boolean becomes BOOLEAN, a
- * JSON integer INT64, a JSON float FLOAT64, a JSON string UTF8, and a JSON array
- * or object LARGE_BINARY holding the re-serialized JSONB value.
+ * into a single Arrow type and trains the target index on that. The supported
+ * variants map from the JSONB type tags: a JSON boolean becomes BOOLEAN, a
+ * JSON integer INT64, a JSON float FLOAT64, and a JSON string UTF8.
  */
 enum JsonTargetDataType {
   /* The type this index was trained on is not recorded here. An index built
@@ -287,6 +286,10 @@ enum JsonTargetDataType {
   JSON_TARGET_DATA_TYPE_INT64 = 2;
   JSON_TARGET_DATA_TYPE_FLOAT64 = 3;
   JSON_TARGET_DATA_TYPE_UTF8 = 4;
+  /* Deprecated. A JSON array or object, stored as its re-serialized JSONB
+   * value. No query can be served by an index of this type, so writers should
+   * not produce it, and future versions may reject it at index creation.
+   */
   JSON_TARGET_DATA_TYPE_LARGE_BINARY = 5;
 }
 
