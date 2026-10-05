@@ -376,15 +376,26 @@ impl StorageOptions {
         }
     }
 
-    /// Subset of options relevant for gcs storage
+    /// Return options recognized by [`GoogleConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as
+    /// `google_service_account`) wins, followed by case variants of that name.
+    /// Remaining ties use the lexicographically smallest original key. Empty
+    /// values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::gcp::GoogleConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("service_account".into(), "alias.json".into()),
+    ///     ("google_service_account".into(), "canonical.json".into()),
+    /// ]));
+    /// assert_eq!(options.as_gcs_options()[&GoogleConfigKey::ServiceAccount], "canonical.json");
+    /// ```
     pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let gcs_key = GoogleConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((gcs_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 }
 
@@ -400,6 +411,37 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[rstest::rstest]
+    #[case::canonical("google_service_account", "service_account")]
+    #[case::canonical_over_case_variant("google_service_account", "GOOGLE_SERVICE_ACCOUNT")]
+    #[case::canonical_case_tie("GOOGLE_SERVICE_ACCOUNT", "Google_Service_Account")]
+    #[case::case_variant_over_alias("GOOGLE_SERVICE_ACCOUNT", "service_account_path")]
+    #[case::lexical_alias("service_account", "service_account_path")]
+    #[case::case_alias("SERVICE_ACCOUNT", "service_account")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_gcs_options(),
+                HashMap::from([(GoogleConfigKey::ServiceAccount, preferred_value.to_string())])
+            );
+        }
+    }
 
     fn external_account_storage_options(
         temp_dir: &TempDir,

@@ -1691,6 +1691,40 @@ pub struct StorageOptions(pub HashMap<String, String>);
 
 impl StorageOptions {
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn as_cloud_options<K>(&self) -> HashMap<K, String>
+    where
+        K: FromStr + AsRef<str> + Eq + std::hash::Hash,
+    {
+        let mut options: HashMap<K, (&str, &str)> = HashMap::new();
+        for (source_key, value) in &self.0 {
+            let Ok(config_key) = K::from_str(&source_key.to_ascii_lowercase()) else {
+                continue;
+            };
+            let source_key = source_key.as_str();
+            let canonical_key = config_key.as_ref();
+            // Rank spellings so conflicting aliases cannot depend on HashMap iteration order.
+            if let Some((selected_key, _)) = options.get(&config_key)
+                && (
+                    !source_key.eq_ignore_ascii_case(canonical_key),
+                    source_key != canonical_key,
+                    source_key,
+                ) >= (
+                    !selected_key.eq_ignore_ascii_case(canonical_key),
+                    *selected_key != canonical_key,
+                    *selected_key,
+                )
+            {
+                continue;
+            }
+            options.insert(config_key, (source_key, value.as_str()));
+        }
+        options
+            .into_iter()
+            .map(|(key, (_, value))| (key, value.to_string()))
+            .collect()
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn merge_env_options(
         &mut self,
         env_options: impl IntoIterator<

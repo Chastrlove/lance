@@ -624,15 +624,25 @@ impl StorageOptions {
         });
     }
 
-    /// Subset of options relevant for s3 storage
+    /// Return options recognized by [`AmazonS3ConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as `aws_region`)
+    /// wins, followed by case variants of that name. Remaining ties use the
+    /// lexicographically smallest original key. Empty values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::aws::AmazonS3ConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("region".into(), "us-east-1".into()),
+    ///     ("aws_region".into(), "eu-west-1".into()),
+    /// ]));
+    /// assert_eq!(options.as_s3_options()[&AmazonS3ConfigKey::Region], "eu-west-1");
+    /// ```
     pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((s3_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 
     /// Parse the `aws_provider_scheme` storage option, if set.
@@ -684,6 +694,36 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::canonical("aws_region", "region")]
+    #[case::canonical_over_case_variant("aws_region", "AWS_REGION")]
+    #[case::canonical_case_tie("AWS_REGION", "Aws_Region")]
+    #[case::case_variant_over_alias("AWS_REGION", "region")]
+    #[case::lexical_alias("REGION", "region")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_s3_options(),
+                HashMap::from([(AmazonS3ConfigKey::Region, preferred_value.to_string())])
+            );
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MockAwsCredentialsProvider {
