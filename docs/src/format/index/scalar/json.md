@@ -17,24 +17,13 @@ type is covered:
 | `Float64`         | `JSON_TARGET_DATA_TYPE_FLOAT64`      | The decoded float                     |
 | `String`          | `JSON_TARGET_DATA_TYPE_UTF8`         | The decoded string, unquoted          |
 | `Array`, `Object` | `JSON_TARGET_DATA_TYPE_LARGE_BINARY` | The subtree, re-serialized as JSONB   |
-| `Null`            | —                                    | Indexed as a null in the target index |
 
-A document whose path is absent is indexed as a null, the same as an explicit
-JSON null.
+A JSON null, or a document whose path is absent, is indexed as a null.
 
 The chosen type is recorded in the index details as `target_data_type`. It is
 `JSON_TARGET_DATA_TYPE_UNSPECIFIED` for an index written before the details
 carried the type, and for one whose type a later rewrite of the details could
 not recover.
-
-Recovering the type of such an index is ordered. A reader asks the target index
-first: some target types retain the Arrow type they were trained on, and that
-answer is authoritative. Only when the target cannot report one is the type
-inferred by decoding the data again, reading the type tag of the first non-null
-value at the path and falling back to `JSON_TARGET_DATA_TYPE_UTF8` when every
-value is null. Inference depends on which rows are read, so it is not guaranteed
-to reproduce the type the index was originally built with — which is what
-`target_data_type` exists to prevent, and why it is the last resort.
 
 ## Index Details
 
@@ -78,3 +67,14 @@ while the target index holds decoded native values, so an indexed
 `json_extract` predicate would answer a different question than an unindexed
 one; quoting is also not order-preserving, so even a `UTF8` target cannot serve
 its ranges.
+
+For example, given the documents `{"val": "ab"}` and `{"val": "ab!"}`, a JSON
+index on `val` stores the `UTF8` keys `ab` and `ab!`, while
+`json_extract(doc, 'val')` evaluates to the text `"ab"` and `"ab!"`, quotes
+included:
+
+- `json_extract(doc, 'val') = '"ab"'` matches the first document, but the target
+  index holds no key `"ab"`, so an indexed lookup would match nothing.
+- `json_extract(doc, 'val') > '"ab"'` does not match the second document, because
+  `!` sorts before `"`. In the target index `ab!` sorts after `ab`, so an indexed
+  range would match it.
