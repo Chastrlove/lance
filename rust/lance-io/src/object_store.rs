@@ -2794,8 +2794,7 @@ mod tests {
 
         // Create destination with nested directories that don't exist yet
         let dest_file = dest_dir.join("nested").join("dirs").join("copied_file.txt");
-        let dest_str = dest_file.to_str().unwrap();
-        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+        let to_path = Path::from_absolute_path(&dest_file).unwrap();
 
         match mode {
             "copy" => destination_store.copy(&from_path, &to_path).await.unwrap(),
