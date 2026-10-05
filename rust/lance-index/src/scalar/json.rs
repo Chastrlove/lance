@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use std::{
     ops::Bound,
     sync::{Arc, Mutex},
@@ -101,6 +102,22 @@ impl Index for JsonIndex {
     }
 }
 
+impl JsonIndex {
+    /// The JSON index over a rewritten target index.
+    fn wrap_target(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
+        let json_details = crate::pb::JsonIndexDetails {
+            path: self.path.clone(),
+            target_details: Some(target_created.index_details),
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&json_details)?,
+            // TODO: We should store the target index version in the details
+            index_version: JSON_INDEX_VERSION,
+            files: target_created.files,
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for JsonIndex {
     async fn search(
@@ -134,16 +151,19 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.wrap_target(target_created)
+    }
+
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let target_created = self
+            .target_index
+            .remap_streaming(translator, dest_store)
+            .await?;
+        self.wrap_target(target_created)
     }
 
     async fn update(
@@ -1069,6 +1089,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1076,8 +1097,21 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
+        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
+        // the target's; `JsonIndexDetails` does not yet record the target's own
+        // version. Every target this wrapper builds comes from a fresh training
+        // pass in this same codebase, so it is always at that plugin's current
+        // format; passing the target's own max version is the accurate stand-in
+        // until the target's version is recorded here directly.
         let target_index = target_plugin
-            .load_index(index_store, target_details, frag_reuse_index, cache)
+            .load_index(
+                index_store,
+                target_details,
+                target_plugin.version(),
+                frag_reuse_index,
+                cache,
+            )
             .await?;
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
     }
@@ -1391,7 +1425,13 @@ mod tests {
             .unwrap();
 
         plugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap()
     }
@@ -1504,6 +1544,7 @@ mod tests {
             .load_index(
                 dest_store,
                 &created.index_details,
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
