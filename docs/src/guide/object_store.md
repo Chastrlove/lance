@@ -59,10 +59,11 @@ lance.write_dataset(
 ```
 
 The default is `"false"`. When enabled, Lance syncs local data, transaction,
-and manifest files before reporting successful writes. On Unix it also syncs
-their directory entries. This increases write latency. Pass the option again
-when reopening a dataset for later writes; it is a store setting, not a dataset
-property. Only `"true"` and `"false"` are accepted.
+and manifest files before reporting successful writes, including copied files
+during deep clones. Local copies use the destination's setting. On Unix it also
+syncs their directory entries, including newly created directories. This increases
+write latency. Pass the option again when reopening a dataset for later writes;
+it is a store setting, not a dataset property. Only `"true"` and `"false"` are accepted.
 
 ### Bulk copy strategy
 

@@ -2083,6 +2083,7 @@ async fn append_dataset(
 async fn test_deep_clone(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
+    #[values(false, true)] local_fsync: bool,
 ) {
     // Setup source and target dirs
     let test_dir = TempStdDir::default();
@@ -2102,7 +2103,7 @@ async fn test_deep_clone(
         data_reader,
         test_uri,
         Some(WriteParams {
-            max_rows_per_file: 64,
+            max_rows_per_file: 32,
             max_rows_per_group: 16,
             data_storage_version: Some(data_storage_version),
             ..Default::default()
@@ -2138,8 +2139,17 @@ async fn test_deep_clone(
         .await
         .unwrap();
 
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+        ))),
+        ..Default::default()
+    };
     // Perform deep clone
-    let cloned_dataset = branch.deep_clone(cloned_uri, "tag", None).await.unwrap();
+    let cloned_dataset = branch
+        .deep_clone(cloned_uri, "tag", Some(store_params.clone()))
+        .await
+        .unwrap();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2205,7 +2215,11 @@ async fn test_deep_clone(
     let clone_dir = test_dir.join("clone_ds_old_ver");
     let cloned_ds = clone_dir.to_str().unwrap();
     let cloned_dataset = branch
-        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
+        .deep_clone(
+            cloned_ds,
+            ("branch", original_version - 1),
+            Some(store_params),
+        )
         .await
         .unwrap();
     let store = branch.object_store.as_ref();
@@ -2225,6 +2239,13 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+
+    std::fs::remove_dir_all(base_dir).unwrap();
+    for (uri, expected_rows) in [(cloned_uri, 54), (cloned_ds, 64)] {
+        let reopened = Dataset::open(uri).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+    }
 }
 
 #[tokio::test]

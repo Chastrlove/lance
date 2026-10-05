@@ -1217,6 +1217,8 @@ impl ObjectStore {
     /// copy. The source and destination may use different object stores. The copy
     /// succeeds only after the byte count reported by the writer and a destination
     /// metadata lookup both match the source size.
+    /// Local copies use the filesystem's native copy unless the destination
+    /// enables `local_fsync`, in which case its durable local writer is used.
     ///
     /// ```no_run
     /// # use lance_core::Result;
@@ -1259,7 +1261,10 @@ impl ObjectStore {
         destination_path: &Path,
     ) -> Result<WriteResult> {
         let started_at = Instant::now();
-        if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
+        if self.has_direct_local_paths()
+            && destination_store.has_direct_local_paths()
+            && !destination_store.local_fsync
+        {
             let source_size = std::fs::metadata(super::local::to_local_path(source_path))
                 .map_err(|source| {
                     let source = if source.kind() == std::io::ErrorKind::NotFound {
@@ -1463,6 +1468,11 @@ impl ObjectStore {
         max_single_copy: u64,
     ) -> Result<()> {
         if self.has_direct_local_paths() {
+            // Native filesystem copies bypass the writer's file and directory syncs.
+            if self.local_fsync {
+                self.copy_via_stream(from, self, to).await?;
+                return Ok(());
+            }
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
@@ -2745,8 +2755,15 @@ mod tests {
         assert_eq!(copied_content, b"test content");
     }
 
+    #[rstest]
+    #[case::copy("copy")]
+    #[case::bulk("bulk")]
+    #[case::stream("stream")]
     #[tokio::test]
-    async fn test_copy_creates_parent_directories() {
+    async fn test_copy_creates_parent_directories(
+        #[case] mode: &str,
+        #[values(false, true)] local_fsync: bool,
+    ) {
         let source_dir = TempStdDir::default();
         let dest_dir = TempStdDir::default();
 
@@ -2755,10 +2772,22 @@ mod tests {
         let source_file = source_dir.join(source_file_name);
         std::fs::write(&source_file, b"test content").unwrap();
 
-        // Create ObjectStore for local filesystem
-        let (store, base_path) = ObjectStore::from_uri(source_dir.to_str().unwrap())
+        let (source_store, base_path) = ObjectStore::from_uri(source_dir.to_str().unwrap())
             .await
             .unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let (destination_store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            dest_dir.to_str().unwrap(),
+            &params,
+        )
+        .await
+        .unwrap();
 
         // Create paths
         let from_path = base_path.clone().join(source_file_name);
@@ -2768,14 +2797,31 @@ mod tests {
         let dest_str = dest_file.to_str().unwrap();
         let to_path = object_store::path::Path::parse(dest_str).unwrap();
 
-        // Perform the copy operation - should create parent directories
-        store.copy(&from_path, &to_path).await.unwrap();
+        match mode {
+            "copy" => destination_store.copy(&from_path, &to_path).await.unwrap(),
+            "bulk" => {
+                let result = source_store
+                    .copy_bulk(&from_path, &destination_store, &to_path)
+                    .await
+                    .unwrap();
+                assert_eq!(result.size, b"test content".len());
+            }
+            "stream" => {
+                let result = source_store
+                    .copy_via_stream(&from_path, &destination_store, &to_path)
+                    .await
+                    .unwrap();
+                assert_eq!(result.size, b"test content".len());
+            }
+            _ => unreachable!(),
+        }
 
         // Verify the file was copied correctly and directories were created
         assert!(dest_file.exists());
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+        assert_eq!(std::fs::read(&source_file).unwrap(), b"test content");
     }
 
     /// Inner store that forwards everything to `InMemory` except single-shot
