@@ -171,7 +171,7 @@ impl Dataset {
             ));
         }
 
-        let preprocessor = if let Some(blob_ids) = blob_ids {
+        let mut preprocessor = if let Some(blob_ids) = blob_ids {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
             let object_store = self.object_store(target.base_id).await?;
             let external_base_resolver = blob_v2_external_base_resolver(

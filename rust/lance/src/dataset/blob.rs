@@ -1555,6 +1555,13 @@ fn prepared_blob_to_descriptor(
                 output_ids.push(blob_ids.value(row));
                 output_uris.push(String::new());
             }
+            BlobKind::Managed => {
+                output_kinds.push(BlobKind::Managed as u8);
+                output_positions.push(positions.value(row));
+                output_sizes.push(sizes.value(row));
+                output_ids.push(blob_ids.value(row));
+                output_uris.push(uris.value(row).to_string());
+            }
             BlobKind::External => {
                 output_kinds.push(BlobKind::External as u8);
                 output_positions.push(if positions.is_null(row) {
@@ -5423,16 +5430,17 @@ mod tests {
 
     use super::{
         BlobEntry, BlobFile, BlobMaterializationBudget, BlobMaterializationBudgetState,
-        BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ExternalBlobSource, ReadBlobsExecution, blob_version_from_descriptions,
-        collect_blob_files_v1, data_file_key_from_path, execute_blob_entries,
-        execute_blob_read_batches_stream, execute_blob_read_plan, plan_blob_read_batches,
-        plan_blob_read_plans,
+        BlobRangeRequest, BlobReadRange, BlobSource, BlobV2DescriptorColumns,
+        ExternalBaseCandidate, ExternalBaseResolver, ExternalBlobSource, ReadBlobsExecution,
+        blob_version_from_descriptions, collect_blob_files_v1, data_file_key_from_path,
+        execute_blob_entries, execute_blob_read_batches_stream, execute_blob_read_plan,
+        plan_blob_read_batches, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
         blob::{
-            BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobRange, PackedBlobWriter, blob_field,
+            BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange,
+            PackedBlobWriter, blob_field,
         },
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
@@ -7478,6 +7486,34 @@ mod tests {
         let second = blobs[1].as_ref().unwrap().read().await.unwrap();
         assert_eq!(first.as_ref(), b"hello");
         assert_eq!(second.as_ref(), b"world");
+    }
+
+    #[rstest]
+    #[case::range(0, 7, 16)]
+    #[case::empty(u32::MAX, 0, 0)]
+    fn managed_prepared_batch_preserves_address(
+        #[case] base_id: u32,
+        #[case] offset: u64,
+        #[case] size: u64,
+    ) {
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        builder
+            .push(BlobDescriptor::Managed {
+                base_id,
+                uri: "_blobs/payload.blob".to_string(),
+                offset,
+                size,
+            })
+            .unwrap();
+        let (field, array) = builder.finish().unwrap().into_parts();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+        let batch = super::prepared_blob_batch_to_descriptors(&batch).unwrap();
+        let columns = BlobV2DescriptorColumns::new(batch["blob"].as_struct());
+        assert_eq!(columns.kinds.value(0), BlobKind::Managed as u8);
+        assert_eq!(columns.blob_ids.value(0), base_id);
+        assert_eq!(columns.positions.value(0), offset);
+        assert_eq!(columns.sizes.value(0), size);
+        assert_eq!(columns.blob_uris.value(0), "_blobs/payload.blob");
     }
 
     #[tokio::test]
