@@ -8571,7 +8571,10 @@ mod tests {
                     .requests
                     .iter()
                     .filter(|request| request.path == blob.source.path)
-                    .all(|request| request.method != "get_opts" || request.range.is_some()),
+                    .all(|request| {
+                        request.method != "head"
+                            && (request.method != "get_opts" || request.range.is_some())
+                    }),
                 "{stats:?}"
             );
         }
@@ -8992,7 +8995,7 @@ mod tests {
         let size_queries = stats
             .requests
             .iter()
-            .filter(|request| request.method == "get_opts" && request.range.is_none())
+            .filter(|request| request.method == "head")
             .count();
         // A descriptor without a length still needs one size query per selection.
         let expected_size_queries = if desc.column(2).as_primitive::<UInt64Type>().value(0) == 0 {
