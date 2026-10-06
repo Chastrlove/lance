@@ -19,15 +19,17 @@
 //! makes the same split when it plans the sort itself; this rule does it for
 //! plans built elsewhere, such as SQL over [`LanceTableProvider`](crate::datafusion::LanceTableProvider).
 //!
-//! A pass-through node is one the rule can rebuild over the narrowed read:
+//! A pass-through node is one the rule can rebuild over the narrowed read
+//! without changing any value the take later fetches:
 //!
 //! - a [`ProjectionExec`] that only selects columns, narrowed to the columns
 //!   the read still has;
 //! - a [`RepartitionExec`] that does not hash (hash partitioning holds column
 //!   indices into the wide schema);
-//! - any other single-child node reporting [`CardinalityEffect::Equal`] with no
-//!   fetch whose output columns are its input columns, such as a custom node a
-//!   `TableProvider` wraps around the scan. A node of this kind that rewrites
+//! - a [`CoalescePartitionsExec`] or [`CooperativeExec`];
+//! - a custom node the caller certifies with
+//!   [`TopKLateMaterialization::with_pass_through`], such as one a
+//!   `TableProvider` wraps around the scan. A certified node that rewrites
 //!   schema metadata is applied again above the take, since [`TakeExec`] emits
 //!   the dataset's metadata.
 //!
@@ -45,6 +47,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -64,6 +67,10 @@ use super::filtered_read::FilteredReadExec;
 /// over that read unchanged.
 pub type ReadEligibility = Arc<dyn Fn(&FilteredReadExec, &ConfigOptions) -> bool + Send + Sync>;
 
+/// Decides whether a custom node may be walked through. See
+/// [`TopKLateMaterialization::with_pass_through`].
+pub type PassThrough = Arc<dyn Fn(&dyn ExecutionPlan) -> bool + Send + Sync>;
+
 /// Defer every non-sort column of a top-k over a Lance read to a take of the
 /// surviving rows. See the module docs.
 ///
@@ -80,12 +87,15 @@ pub type ReadEligibility = Arc<dyn Fn(&FilteredReadExec, &ConfigOptions) -> bool
 pub struct TopKLateMaterialization {
     /// `None`: every read qualifies.
     read_eligibility: Option<ReadEligibility>,
+    /// `None`: only the built-in pass-through nodes.
+    pass_through: Option<PassThrough>,
 }
 
 impl Debug for TopKLateMaterialization {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TopKLateMaterialization")
             .field("read_eligibility", &self.read_eligibility.is_some())
+            .field("pass_through", &self.pass_through.is_some())
             .finish()
     }
 }
@@ -103,6 +113,18 @@ impl TopKLateMaterialization {
         eligibility: impl Fn(&FilteredReadExec, &ConfigOptions) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.read_eligibility = Some(Arc::new(eligibility));
+        self
+    }
+
+    /// Also walk through custom nodes for which `pass_through` returns `true`.
+    /// Such a node must keep every row, column, and value of its single input
+    /// (it may rewrite schema metadata), and must hold no column indices, as
+    /// it is rebuilt over the narrowed read with `with_new_children`.
+    pub fn with_pass_through(
+        mut self,
+        pass_through: impl Fn(&dyn ExecutionPlan) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.pass_through = Some(Arc::new(pass_through));
         self
     }
 
@@ -146,7 +168,7 @@ impl TopKLateMaterialization {
             } else if let Some(take) = current.downcast_ref::<TakeExec>() {
                 dropped_takes.push(take.dataset().clone());
             } else {
-                check_pass_through(&current)?;
+                self.check_pass_through(&current)?;
                 chain.push(current.clone());
             }
             let [child] = &current.children()[..] else {
@@ -207,12 +229,7 @@ impl TopKLateMaterialization {
         narrow.with_row_last_updated_at_version = full.with_row_last_updated_at_version;
         narrow.with_row_created_at_version = full.with_row_created_at_version;
         narrow.blob_handling = full.blob_handling.clone();
-        let narrow_read = FilteredReadExec::try_new(
-            dataset.clone(),
-            read.options().clone().with_projection(narrow),
-            read.index_input().cloned(),
-        )
-        .map_err(|e| e.to_string())?;
+        let narrow_read = read.with_projection(narrow).map_err(|e| e.to_string())?;
         let mut input: Arc<dyn ExecutionPlan> = Arc::new(narrow_read);
         for node in chain.iter().rev() {
             input = rebuild(node, input)?;
@@ -250,6 +267,61 @@ impl TopKLateMaterialization {
         }
         Ok(Some(output))
     }
+
+    /// `Ok` if [`rebuild`] can re-create `node` over the narrowed read.
+    fn check_pass_through(&self, node: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
+        let decline = |why: &str| {
+            Err(format!(
+                "{} between the sort and the read {why}",
+                node.name()
+            ))
+        };
+        if node.fetch().is_some() {
+            // `CoalescePartitionsExec` reports `Equal` even when a fetch caps its rows.
+            return decline("has a fetch");
+        }
+        if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+            let selects_columns = projection.expr().iter().all(|projected| {
+                projected
+                    .expr
+                    .downcast_ref::<Column>()
+                    .is_some_and(|column| column.name() == projected.alias)
+            });
+            return if selects_columns {
+                Ok(())
+            } else {
+                decline("computes or renames columns")
+            };
+        }
+        if let Some(repartition) = node.downcast_ref::<RepartitionExec>() {
+            return if matches!(repartition.partitioning(), Partitioning::Hash(..)) {
+                decline("hash-partitions")
+            } else {
+                Ok(())
+            };
+        }
+        if node.is::<CoalescePartitionsExec>() || node.is::<CooperativeExec>() {
+            return Ok(());
+        }
+        // `Equal` cardinality and unchanged columns do not mean unchanged values.
+        if !self
+            .pass_through
+            .as_ref()
+            .is_some_and(|pass_through| pass_through(node.as_ref()))
+        {
+            return decline("is not a known pass-through node");
+        }
+        if !matches!(node.cardinality_effect(), CardinalityEffect::Equal) {
+            return decline("may change the row count");
+        }
+        let [input] = &node.children()[..] else {
+            return decline("does not have exactly one child");
+        };
+        if node.schema().fields() != input.schema().fields() {
+            return decline("changes the columns");
+        }
+        Ok(())
+    }
 }
 
 impl PhysicalOptimizerRule for TopKLateMaterialization {
@@ -281,56 +353,11 @@ impl PhysicalOptimizerRule for TopKLateMaterialization {
     }
 }
 
-/// `Ok` if [`rebuild`] can re-create `node` over the narrowed read.
-fn check_pass_through(node: &Arc<dyn ExecutionPlan>) -> Result<(), String> {
-    let decline = |why: &str| {
-        Err(format!(
-            "{} between the sort and the read {why}",
-            node.name()
-        ))
-    };
-    if node.fetch().is_some() {
-        // `CoalescePartitionsExec` reports `Equal` even when a fetch caps its rows.
-        return decline("has a fetch");
-    }
-    if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-        let selects_columns = projection.expr().iter().all(|projected| {
-            projected
-                .expr
-                .downcast_ref::<Column>()
-                .is_some_and(|column| column.name() == projected.alias)
-        });
-        return if selects_columns {
-            Ok(())
-        } else {
-            decline("computes or renames columns")
-        };
-    }
-    if let Some(repartition) = node.downcast_ref::<RepartitionExec>()
-        && matches!(repartition.partitioning(), Partitioning::Hash(..))
-    {
-        return decline("hash-partitions");
-    }
-    if node.is::<SortExec>() || node.is::<SortPreservingMergeExec>() {
-        // Their sort expressions hold column indices into the wide schema.
-        return decline("sorts");
-    }
-    if !matches!(node.cardinality_effect(), CardinalityEffect::Equal) {
-        return decline("may change the row count");
-    }
-    let [input] = &node.children()[..] else {
-        return decline("does not have exactly one child");
-    };
-    if node.schema().fields() != input.schema().fields() {
-        return decline("changes the columns");
-    }
-    Ok(())
-}
-
 fn rewrites_metadata(node: &Arc<dyn ExecutionPlan>) -> bool {
     !node.is::<ProjectionExec>()
         && !node.is::<RepartitionExec>()
         && !node.is::<CoalescePartitionsExec>()
+        && !node.is::<CooperativeExec>()
         && node
             .children()
             .first()
