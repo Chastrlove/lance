@@ -1793,28 +1793,9 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let mut writer = versions::open_writer(
-                        write_version,
-                        &dataset.object_store,
-                        &write_schema,
-                        &dataset.base,
-                        super::WriterOptions {
-                            base_id: if matches!(
-                                write_version,
-                                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                            ) && write_schema
-                                .fields_pre_order()
-                                .any(|field| field.is_blob_v2())
-                            {
-                                Some(dataset.managed_default_base()?.id)
-                            } else {
-                                None
-                            },
-                            add_data_dir: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                    let mut writer =
+                        versions::open_update_writer(write_version, &dataset, &write_schema, false)
+                            .await?;
 
                     // We need to remove rowaddr before writing.
                     batches

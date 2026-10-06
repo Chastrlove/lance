@@ -103,7 +103,14 @@ copying or deleting the blob that B still references. The blob's path may retain
 A's name, but resolving and retaining the blob no longer requires A's data file.
 Cleanup retains objects referenced by protected snapshots; a partially live
 packed object is retained as a whole. Blob reads continue to return the same
-bytes, while raw descriptor scans can now report `kind = 4` for Managed values.
+bytes. Raw descriptor scans report `kind = 4` for a Managed object relative to
+the data file's table base, or `kind = 5` with an explicit registered base ID.
+The default table base is implicit: moving the complete dataset moves its local
+Managed objects without retaining a URI to the old location. Explicit base IDs
+must already be registered before writing references to them. A shallow clone
+keeps the source table base through its data-file metadata; compaction preserves
+that base when it moves descriptors into new files. A deep clone copies local
+objects at the same relative paths without rewriting their descriptors.
 
 Before activating Managed Blobs on an existing table, upgrade all clients that
 run table maintenance to a version that supports Managed Blobs, or stop their

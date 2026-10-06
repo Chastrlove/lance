@@ -701,18 +701,11 @@ pub async fn open_update_writer(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
-    let mut options = WriterOptions::update(
+    let options = WriterOptions::update(
         dataset.session.store_registry(),
         external_base_resolver,
         allow_external_blob_outside_bases,
     );
-    if matches!(
-        version,
-        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-    ) && schema.fields_pre_order().any(Field::is_blob_v2)
-    {
-        options.base_id = Some(dataset.managed_default_base()?.id);
-    }
     open_writer(
         version,
         &dataset.object_store,

@@ -557,14 +557,15 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                 }
                 validate_blob_id(blob_id_col.value(row))?;
             }
-            BlobKind::Managed => {
+            BlobKind::Managed | BlobKind::ManagedWithBase => {
                 if uri_col.is_null(row)
-                    || blob_id_col.is_null(row)
+                    || ((kind_col.value(row) == BlobKind::ManagedWithBase as u8)
+                        != blob_id_col.is_valid(row))
                     || blob_size_col.is_null(row)
                     || position_col.is_null(row)
                 {
                     return Err(Error::invalid_input(format!(
-                        "Prepared Managed blob row {row} must set `uri`, `blob_id`, `blob_size`, and `position`"
+                        "Prepared Managed blob row {row} requires `uri`, `blob_size`, and `position`, plus `blob_id` for an explicit base"
                     )));
                 }
                 lance_core::utils::blob::validate_managed_reference(
@@ -645,10 +646,10 @@ pub enum BlobDescriptor {
     },
     /// Payload bytes stored as the full contents of a dedicated sidecar blob.
     Dedicated { blob_id: u32, size: u64 },
-    /// A known range in an immutable Lance-owned object. The exact `base_id`
-    /// must be bound in the same committed snapshot as this descriptor.
+    /// A known range in an immutable Lance-owned object. `None` uses the
+    /// writer's table base; `Some(id)` requires an already registered base.
     Managed {
-        base_id: u32,
+        base_id: Option<u32>,
         uri: String,
         offset: u64,
         size: u64,
@@ -847,10 +848,14 @@ impl BlobDescriptorArrayBuilder {
                     size,
                 } => {
                     validity.append_non_null();
-                    kind_builder.append_value(BlobKind::Managed as u8);
+                    kind_builder.append_value(if base_id.is_some() {
+                        BlobKind::ManagedWithBase as u8
+                    } else {
+                        BlobKind::Managed as u8
+                    });
                     data_builder.append_null();
                     uri_builder.append_value(uri);
-                    blob_id_builder.append_value(base_id);
+                    blob_id_builder.append_option(base_id);
                     blob_size_builder.append_value(size);
                     position_builder.append_value(offset);
                 }

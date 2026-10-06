@@ -38,7 +38,6 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
 use lance_namespace::LanceNamespace;
-use lance_table::format::BasePath;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
     ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
@@ -2467,18 +2466,18 @@ impl Dataset {
         }
     }
 
-    pub(crate) fn managed_default_base(&self) -> Result<BasePath> {
-        if let Some(base) = self
-            .manifest
-            .base_paths
-            .values()
-            .filter(|base| base.path == self.uri && base.is_dataset_root)
-            .min_by_key(|base| base.id)
-        {
-            return Ok(base.clone());
+    pub(crate) fn blob_base_path(&self, base_id: Option<u32>) -> Result<Path> {
+        match base_id {
+            Some(id) => self
+                .manifest
+                .base_paths
+                .get(&id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Managed blob references unknown base_id {id}"))
+                })?
+                .extract_path(self.session.store_registry()),
+            None => Ok(self.base.clone()),
         }
-        let id = BasePath::unused_id(self.manifest.base_paths.keys().copied())?;
-        Ok(BasePath::new(id, self.uri.clone(), None, true))
     }
 
     async fn base_object_store(&self, base_id: u32) -> Result<Arc<ObjectStore>> {

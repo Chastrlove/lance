@@ -199,17 +199,8 @@ impl Dataset {
             None
         };
         if let Some(writer) = preprocessor.take() {
-            let base = if let Some(id) = target.base_id {
-                self.manifest.base_paths.get(&id).cloned().ok_or_else(|| {
-                    Error::invalid_input(format!("Managed part target has unknown base ID {id}"))
-                })?
-            } else {
-                self.managed_default_base()?
-            };
-            preprocessor = Some(
-                writer
-                    .with_managed_base(base.id, base.extract_path(self.session.store_registry())?),
-            );
+            let root = self.blob_base_path(target.base_id)?;
+            preprocessor = Some(writer.with_managed_base(target.base_id, root));
         }
 
         let file_name = format!("{}.part", generate_random_filename());
@@ -953,33 +944,8 @@ where
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
 
-    let default_blob_base = if schema.fields_pre_order().any(|field| field.is_blob_v2()) {
-        Some(if let Some(dataset) = dataset {
-            dataset.managed_default_base()?.id
-        } else {
-            lance_table::format::BasePath::unused_id(
-                params.initial_bases.iter().flatten().map(|base| base.id),
-            )?
-        })
-    } else {
-        None
-    };
-    // Keep all physical write destinations, including the explicit primary
-    // alias used by Managed descriptors, available to failed-write cleanup.
-    let mut cleanup_bases = target_bases_info.clone().unwrap_or_default();
-    if let Some(base_id) = default_blob_base {
-        cleanup_bases.push(TargetBaseInfo {
-            base_id,
-            object_store: object_store.clone(),
-            base_dir: base_dir.clone(),
-            is_dataset_root: true,
-        });
-    }
-    let open_writer = move |object_store, schema, base_dir, mut options: WriterOptions| {
-        options.base_id = options.base_id.or(default_blob_base);
-        open_writer(object_store, schema, base_dir, options)
-    };
     let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
+    let cleanup_bases = target_bases_info.clone();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
         base_dir,
@@ -1187,7 +1153,13 @@ where
         // Drop the writer so its in-progress file is cleaned up (LocalWriter
         // removes its temp file; ObjectWriter aborts the multipart upload).
         drop(writer.take());
-        cleanup_data_fragments(&object_store, base_dir, Some(&cleanup_bases), &fragments).await;
+        cleanup_data_fragments(
+            &object_store,
+            base_dir,
+            cleanup_bases.as_deref(),
+            &fragments,
+        )
+        .await;
         return Err(e);
     }
 
@@ -1195,7 +1167,13 @@ where
     if let Some(mut writer) = writer.take() {
         if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
             drop(writer);
-            cleanup_data_fragments(&object_store, base_dir, Some(&cleanup_bases), &fragments).await;
+            cleanup_data_fragments(
+                &object_store,
+                base_dir,
+                cleanup_bases.as_deref(),
+                &fragments,
+            )
+            .await;
             return Err(e);
         }
         match writer.finish().await {
@@ -1217,8 +1195,13 @@ where
             }
             Err(e) => {
                 drop(writer);
-                cleanup_data_fragments(&object_store, base_dir, Some(&cleanup_bases), &fragments)
-                    .await;
+                cleanup_data_fragments(
+                    &object_store,
+                    base_dir,
+                    cleanup_bases.as_deref(),
+                    &fragments,
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -1710,7 +1693,13 @@ async fn build_external_base_resolver(
     )
     .await?;
 
-    Ok(ExternalBaseResolver::new(candidates, store_registry))
+    let mut resolver = ExternalBaseResolver::new(candidates, store_registry);
+    resolver.registered_base_ids = dataset
+        .into_iter()
+        .flat_map(|dataset| dataset.manifest.base_paths.keys().copied())
+        .chain(params.initial_bases.iter().flatten().map(|base| base.id))
+        .collect();
+    Ok(resolver)
 }
 
 pub(super) async fn blob_v2_external_base_resolver(
@@ -2465,8 +2454,6 @@ where
         version,
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
     ) {
-        let base_id = base_id
-            .ok_or_else(|| Error::invalid_input("Managed writer requires an explicit base ID"))?;
         preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
     }
     Ok(Box::new(V2WriterAdapter::new(

@@ -615,22 +615,10 @@ async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments
         .collect::<Vec<_>>();
 
     let dataset = first_fragment.dataset();
-    let cleanup_bases = match dataset.managed_default_base() {
-        Ok(base) => vec![super::write::TargetBaseInfo {
-            base_id: base.id,
-            object_store: dataset.object_store.clone(),
-            base_dir: dataset.base.clone(),
-            is_dataset_root: true,
-        }],
-        Err(error) => {
-            log::warn!("Cannot resolve primary base for failed column write cleanup: {error}");
-            Vec::new()
-        }
-    };
     cleanup_data_fragments(
         &dataset.object_store,
         &dataset.base,
-        Some(&cleanup_bases),
+        None,
         &fragments_to_cleanup,
     )
     .await;

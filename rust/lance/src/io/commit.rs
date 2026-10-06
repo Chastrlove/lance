@@ -620,22 +620,6 @@ async fn do_commit_new_dataset(
         (manifest, indices)
     };
 
-    if manifest.has_managed_blobs() {
-        let id = lance_table::format::BasePath::unused_id(manifest.base_paths.keys().copied())?;
-        if manifest
-            .fragments
-            .iter()
-            .flat_map(|fragment| fragment.referenced_lance_files())
-            .any(|file| file.base_id == Some(id))
-        {
-            manifest.bind_managed_base(lance_table::format::BasePath::new(
-                id,
-                uri.to_string(),
-                None,
-                true,
-            ))?;
-        }
-    }
     let result = write_manifest_file(
         object_store,
         commit_handler.as_ref(),
@@ -1354,7 +1338,6 @@ pub(crate) async fn do_commit_detached_transaction(
         };
 
         manifest.version = random_version;
-        manifest.bind_managed_base(dataset.managed_default_base()?)?;
 
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
@@ -1695,7 +1678,6 @@ pub(crate) async fn commit_transaction(
     // The Arc is kept rather than cloned out: `load_all_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
     let read_version_dataset = dataset.clone();
-    let managed_default_base = read_version_dataset.managed_default_base()?;
     let read_version_indices = load_all_indices(&read_version_dataset).await?;
     let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
         manifest: read_version_dataset.manifest.as_ref(),
@@ -1818,8 +1800,6 @@ pub(crate) async fn commit_transaction(
         };
 
         manifest.version = target_version;
-
-        manifest.bind_managed_base(managed_default_base.clone())?;
 
         let previous_writer_version = &dataset.manifest.writer_version;
         // The versions of Lance prior to when we started writing the writer version
