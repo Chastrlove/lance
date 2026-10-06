@@ -63,7 +63,7 @@ source of truth for which scheme is supported at each `data_storage_version`.
 
 ### Managed objects and client compatibility
 
-Current writers store out-of-line Blob v2 payloads in independently named
+Writers store out-of-line Blob v2 payloads in independently named
 `_blobs/<uuid>.blob` objects and publish the Managed Blob reader and writer
 capability on the table. This works with file formats 2.2 and 2.3; it does not
 require choosing 2.3. Clients that do not understand the capability must refuse
@@ -72,17 +72,27 @@ activate it, even if that batch contains only inline values. The capability
 remains set across later writes and restores.
 
 Compaction preserves Managed payload objects and can adopt existing Packed or
-Dedicated sidecars in place. It records their complete addresses, so deleting
-the original data file does not require copying its sidecars. Cleanup retains
-objects referenced by protected snapshots; a partially live packed object is
-retained as a whole. Blob reads continue to return the same bytes, while raw
-descriptor scans can now report `kind = 4` for Managed values.
+Dedicated sidecars in place. For example, compaction can replace `data/A.lance`
+with `data/B.lance` while B's Managed descriptor records the base and path of
+the existing `data/A/0001.blob`. Cleanup can then delete `data/A.lance` without
+copying or deleting the blob that B still references. The blob's path may retain
+A's name, but resolving and retaining the blob no longer requires A's data file.
+Cleanup retains objects referenced by protected snapshots; a partially live
+packed object is retained as a whole. Blob reads continue to return the same
+bytes, while raw descriptor scans can now report `kind = 4` for Managed values.
 
-After activation, use a client that supports Managed Blobs for all table
-maintenance. Older clients, including v11.0.0, can bypass capability checks when
-running cleanup from an unflagged historical snapshot or a cached handle. Such
-cleanup can delete adopted sidecars by treating their original data file as
-their owner. The table flag does not retrofit those old maintenance paths.
+Before activating Managed Blobs on an existing table, upgrade all clients that
+run table maintenance to a version that supports Managed Blobs, or stop their
+maintenance tasks. After activation, all maintenance must use a supporting
+client.
+
+The table flag prevents older clients from opening a flagged snapshot. It does
+not revoke a handle opened before activation or prevent opening an unflagged
+historical snapshot. Older clients, including v11.0.0, can run cleanup through
+these handles without checking the feature flags of the other manifests they
+inspect. Such cleanup can delete adopted sidecars that newer snapshots still
+reference, because it treats the original data file as their owner. The table
+flag therefore does not protect against these old maintenance paths.
 
 ## Blob v2: Write Patterns
 
