@@ -1219,6 +1219,9 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&new_bases)],
             )?)
         }
+        Operation::Unknown { .. } => Err(Error::input_error(
+            "Cannot convert an operation written by a newer version of Lance".to_string(),
+        )),
     }
 }
 
