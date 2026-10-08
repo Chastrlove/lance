@@ -69,7 +69,6 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
-use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -424,13 +423,14 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    commit_handler: &dyn CommitHandler,
+    commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
+    uri: &str,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
-    store_registry: Arc<ObjectStoreRegistry>,
+    session: Arc<Session>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
@@ -453,7 +453,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(store_registry.clone(), ref_path.as_str())?;
+            ObjectStore::extract_path_from_uri(session.store_registry(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
@@ -461,7 +461,7 @@ async fn do_commit_new_dataset(
             source_store,
             &source_manifest_location,
             ref_path.as_str(),
-            &Session::default(),
+            &session,
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
@@ -480,12 +480,8 @@ async fn do_commit_new_dataset(
         } else {
             vec![]
         };
-        let new_base_id = source_manifest
-            .base_paths
-            .keys()
-            .max()
-            .map(|id| *id + 1)
-            .unwrap_or(0);
+        let new_base_id =
+            lance_table::format::BasePath::unused_id(source_manifest.base_paths.keys().copied())?;
         let mut updated_indices = Vec::with_capacity(indices.len());
         for mut index in indices {
             if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
@@ -504,7 +500,7 @@ async fn do_commit_new_dataset(
                         source_store,
                         &source_base_path,
                         &source_manifest,
-                        store_registry.clone(),
+                        session.store_registry(),
                         &index,
                         base_remap,
                         object_store,
@@ -526,7 +522,12 @@ async fn do_commit_new_dataset(
             }
             updated_indices.push(index);
         }
-        Some((source_manifest, new_base_id, updated_indices))
+        Some((
+            source_manifest,
+            source_manifest_location,
+            new_base_id,
+            updated_indices,
+        ))
     } else {
         None
     };
@@ -551,7 +552,7 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_manifest, new_base_id, updated_indices)),
+        Some((source_manifest, source_manifest_location, new_base_id, updated_indices)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
@@ -565,8 +566,10 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
-            let mut new_manifest = source_manifest;
-            new_manifest.base_paths.clear();
+            let mut new_manifest = source_manifest.clone();
+            if !source_manifest.has_managed_blobs() {
+                new_manifest.base_paths.clear();
+            }
             new_manifest.branch = None;
             new_manifest.tag = None;
             new_manifest.index_section = None; // will be rewritten below
@@ -583,6 +586,31 @@ async fn do_commit_new_dataset(
             }
             new_manifest.fragments = Arc::new(new_frags);
 
+            if source_manifest.has_managed_blobs() {
+                let source_store = source_store.unwrap_or(object_store);
+                let source = Dataset::checkout_manifest(
+                    Arc::new(source_store.clone()),
+                    ObjectStore::extract_path_from_uri(session.store_registry(), ref_path)?,
+                    ref_path.clone(),
+                    Arc::new(source_manifest.clone()),
+                    source_manifest_location.clone(),
+                    session.clone(),
+                    commit_handler.clone(),
+                    None,
+                    None,
+                    None,
+                )?;
+                crate::dataset::blob::clone::copy_blob_columns(
+                    Arc::new(source),
+                    Arc::new(object_store.clone()),
+                    base_path.clone(),
+                    uri,
+                    &mut new_manifest,
+                )
+                .boxed()
+                .await?;
+            }
+
             (new_manifest, updated_indices)
         }
     } else {
@@ -597,7 +625,7 @@ async fn do_commit_new_dataset(
 
     let result = write_manifest_file(
         object_store,
-        commit_handler,
+        commit_handler.as_ref(),
         base_path,
         &mut manifest,
         if indices.is_empty() {
@@ -627,7 +655,7 @@ async fn do_commit_new_dataset(
             // transaction file a landed manifest would reference).
             match verify_commit_outcome(
                 object_store,
-                commit_handler,
+                commit_handler.as_ref(),
                 base_path,
                 manifest.version,
                 transaction,
@@ -666,7 +694,7 @@ async fn do_commit_new_dataset(
         Err(CommitError::OtherError(err)) => {
             match verify_commit_outcome(
                 object_store,
-                commit_handler,
+                commit_handler.as_ref(),
                 base_path,
                 manifest.version,
                 transaction,
@@ -733,24 +761,26 @@ async fn record_new_dataset_commit(
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    commit_handler: &dyn CommitHandler,
+    commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
+    uri: &str,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
-    store_registry: Arc<ObjectStoreRegistry>,
+    session: Arc<Session>,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
         source_store,
         commit_handler,
         base_path,
+        uri,
         transaction,
         write_config,
         manifest_naming_scheme,
         metadata_cache,
-        store_registry,
+        session,
     )
     .await
 }
